@@ -1,0 +1,132 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.vm.fs;
+
+import com.google.common.annotations.VisibleForTesting;
+import dev.architectury.registry.ReloadListenerRegistry;
+import li.cil.oc2.api.API;
+import li.cil.sedna.cpm.Cpm;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.resources.PreparableReloadListener;
+import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.server.packs.resources.ResourceManager;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import javax.annotation.Nullable;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+
+public final class CpmSystemDisk {
+    private static final Logger LOGGER = LogManager.getLogger(CpmSystemDisk.class);
+
+    private static final String DIRECTORY = "cpm";
+    private static final int END_OF_FILE = 0x1A;
+
+    @Nullable
+    private static byte[] image;
+
+    // --------------------------------------------------------------------- //
+
+    public static byte[] getImage() {
+        final byte[] result = image;
+        if (result == null) {
+            throw new IllegalStateException("The CP/M system disk has not been composed yet.");
+        }
+        return result;
+    }
+
+    public static void initialize() {
+        ReloadListenerRegistry.register(PackType.SERVER_DATA, ReloadListener.INSTANCE,
+            Identifier.fromNamespaceAndPath(API.MOD_ID, DIRECTORY));
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @VisibleForTesting
+    static byte[] compose(final Map<String, byte[]> files) {
+        final byte[] composed = readBaseImage();
+        files.forEach((name, content) -> CpmImage.addFile(composed, name, toCpmText(content)));
+        return composed;
+    }
+
+    @VisibleForTesting
+    static byte[] toCpmText(final byte[] content) {
+        for (final byte b : content) {
+            final int value = b & 0xFF;
+            final boolean looksLikeBinaryToMe = value != '\t' && value != '\r' && value != '\n' && (value < 0x20 || value > 0x7E);
+            if (looksLikeBinaryToMe) {
+                return content;
+            }
+        }
+
+        final ByteArrayOutputStream text = new ByteArrayOutputStream(content.length + content.length / 16);
+        for (final byte b : content) {
+            if (b == '\r') {
+                continue;
+            }
+            if (b == '\n') {
+                text.write('\r');
+            }
+            text.write(b);
+        }
+        text.write(END_OF_FILE);
+        return text.toByteArray();
+    }
+
+    private static void reload(final ResourceManager resourceManager) {
+        final Map<Identifier, Resource> resources = resourceManager.listResources(
+            DIRECTORY, location -> !location.getPath().endsWith("/"));
+
+        final List<Identifier> locations = new ArrayList<>(resources.keySet());
+        locations.sort(Comparator.comparing(Identifier::toString));
+
+        final byte[] composed = readBaseImage();
+
+        for (final Identifier location : locations) {
+            final String path = location.getPath();
+            final String name = path.substring(path.lastIndexOf('/') + 1);
+            try (InputStream stream = resources.get(location).open()) {
+                CpmImage.addFile(composed, name, toCpmText(stream.readAllBytes()));
+                LOGGER.info("Added [{}] to the CP/M system disk as [{}].", location, name);
+            } catch (final Throwable e) {
+                LOGGER.error("Failed adding [{}] to the CP/M system disk.", location, e);
+            }
+        }
+
+        image = composed;
+    }
+
+    private static byte[] readBaseImage() {
+        try (InputStream stream = Cpm.getFloppyImage()) {
+            return stream.readAllBytes();
+        } catch (final IOException e) {
+            throw new IllegalStateException("Failed reading the built-in system disk.", e);
+        }
+    }
+
+    private CpmSystemDisk() {
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static final class ReloadListener implements PreparableReloadListener {
+        public static final ReloadListener INSTANCE = new ReloadListener();
+
+        @Override
+        public CompletableFuture<Void> reload(final PreparableReloadListener.SharedState state, final Executor backgroundExecutor, final PreparableReloadListener.PreparationBarrier stage, final Executor gameExecutor) {
+            final ResourceManager resourceManager = state.resourceManager();
+            return CompletableFuture
+                .runAsync(() -> CpmSystemDisk.reload(resourceManager), backgroundExecutor)
+                .thenCompose(stage::wait);
+        }
+    }
+}

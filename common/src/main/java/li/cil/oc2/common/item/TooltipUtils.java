@@ -1,0 +1,194 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.item;
+
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntList;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.block.EnergyConsumingBlock;
+import li.cil.oc2.common.bus.device.DeviceTypeRegistry;
+import li.cil.oc2.common.bus.device.util.Devices;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.energy.EnergyHandler;
+import li.cil.oc2.common.tags.ItemTags;
+import li.cil.oc2.common.util.*;
+import li.cil.oc2.common.util.NBTUtils;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.locale.Language;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.network.chat.TextColor;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.stream.StreamSupport;
+
+import static java.util.Objects.requireNonNull;
+import static li.cil.oc2.common.Constants.ITEMS_TAG_NAME;
+import static li.cil.oc2.common.util.TextFormatUtils.withFormat;
+
+public final class TooltipUtils {
+    private static final MutableComponent DEVICE_NEEDS_REBOOT = Component.translatable(Constants.TOOLTIP_DEVICE_NEEDS_REBOOT).withStyle(s -> s.withColor(TextColor.fromLegacyFormat(ChatFormatting.YELLOW)));
+    private static final MutableComponent CAN_BE_CONFIGURED = Component.translatable(Constants.TOOLTIP_CAN_BE_CONFIGURED).withStyle(s -> s.withColor(TextColor.fromLegacyFormat(ChatFormatting.DARK_GRAY)));
+    private static final MutableComponent DATA_CORRUPTED = Component.translatable(Constants.TOOLTIP_DATA_CORRUPTED).withStyle(s -> s.withColor(TextColor.fromLegacyFormat(ChatFormatting.RED)));
+    private static final MutableComponent DATA_INCONSISTENT = Component.translatable(Constants.TOOLTIP_DATA_INCONSISTENT).withStyle(s -> s.withColor(TextColor.fromLegacyFormat(ChatFormatting.YELLOW)));
+
+    private static final ThreadLocal<List<ItemStack>> ITEM_STACKS = ThreadLocal.withInitial(ArrayList::new);
+    private static final ThreadLocal<IntList> ITEM_STACKS_SIZES = ThreadLocal.withInitial(IntArrayList::new);
+
+    // --------------------------------------------------------------------- //
+
+    public static void tryAddDescription(final ItemStack stack, final Consumer<Component> tooltip) {
+        if (stack.isEmpty()) {
+            return;
+        }
+
+        final String translationKey = stack.getItem().getDescriptionId() + Constants.TOOLTIP_DESCRIPTION_SUFFIX;
+        final Language language = Language.getInstance();
+        if (language.has(translationKey)) {
+            final MutableComponent description = Component.translatable(translationKey);
+            tooltip.accept(withFormat(description, ChatFormatting.GRAY));
+        }
+
+        if (stack.is(ItemTags.DEVICE_NEEDS_REBOOT)) {
+            tooltip.accept(DEVICE_NEEDS_REBOOT);
+        }
+
+        final int energyConsumption;
+        if (stack.getItem() instanceof BlockItem blockItem && blockItem.getBlock() instanceof EnergyConsumingBlock energyConsumingBlock) {
+            energyConsumption = energyConsumingBlock.getEnergyConsumption();
+        } else {
+            final ItemDeviceQuery query = Devices.makeQuery(stack);
+            energyConsumption = Devices.getEnergyConsumption(query);
+        }
+
+        if (energyConsumption > 0) {
+            final MutableComponent energy = withFormat(String.valueOf(energyConsumption), ChatFormatting.GREEN);
+            tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_ENERGY_CONSUMPTION, energy), ChatFormatting.GRAY));
+        }
+
+        if (stack.is(ItemTags.CONFIGURABLE) && !ItemStackUtils.hasModDataTag(stack)) {
+            tooltip.accept(CAN_BE_CONFIGURED);
+        }
+    }
+
+    public static void addBlockEntityInventoryInformation(final ItemStack stack, final Consumer<Component> tooltip) {
+        addInventoryInformation(NBTUtils.getChildTag(ItemStackUtils.getBlockEntityDataTag(stack), ITEMS_TAG_NAME), tooltip);
+    }
+
+    public static void addEntityInventoryInformation(final ItemStack stack, final Consumer<Component> tooltip) {
+        addInventoryInformation(NBTUtils.getChildTag(ItemStackUtils.getModDataTag(stack), ITEMS_TAG_NAME), tooltip);
+    }
+
+    public static void addInventoryInformation(final CompoundTag itemsTag, final Consumer<Component> tooltip) {
+        addInventoryInformation(itemsTag, tooltip, getDeviceTypeNames());
+    }
+
+    public static void addInventoryInformation(final CompoundTag itemsTag, final Consumer<Component> tooltip, final String... subInventoryNames) {
+        final List<ItemStack> itemStacks = ITEM_STACKS.get();
+        itemStacks.clear();
+        final IntList itemStackSizes = ITEM_STACKS_SIZES.get();
+        itemStackSizes.clear();
+
+        collectItemStacks(itemsTag, itemStacks, itemStackSizes);
+
+        for (final String subInventoryName : subInventoryNames) {
+            if (itemsTag.contains(subInventoryName)) {
+                collectItemStacks(itemsTag.getCompoundOrEmpty(subInventoryName), itemStacks, itemStackSizes);
+            }
+        }
+
+        for (int i = 0; i < itemStacks.size(); i++) {
+            final ItemStack itemStack = itemStacks.get(i);
+            tooltip.accept(Component.literal("- ").append(itemStack.getDisplayName()).withStyle(style -> style.withColor(TextColor.fromLegacyFormat(ChatFormatting.GRAY))).append(Component.literal(" x").append(String.valueOf(itemStackSizes.getInt(i))).withStyle(style -> style.withColor(TextColor.fromLegacyFormat(ChatFormatting.DARK_GRAY)))));
+        }
+    }
+
+    public static void addEntityEnergyInformation(final ItemStack stack, final Consumer<Component> tooltip) {
+        final EnergyHandler energy = Capabilities.get(stack, Capabilities.ENERGY_STORAGE);
+        if (energy == null || energy.getEnergyStored() == 0) {
+            return;
+        }
+
+        final MutableComponent value = withFormat(energy.getEnergyStored() + "/" + energy.getMaxEnergyStored(), ChatFormatting.GREEN);
+        tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_ENERGY, value), ChatFormatting.GRAY));
+    }
+
+    public static void addEnergyConsumption(final double value, final Consumer<Component> tooltip) {
+        if (value > 0) {
+            final var formattedValue = withFormat(TextFormatUtils.formatNumber(value), ChatFormatting.GREEN);
+            tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_ENERGY_CONSUMPTION, formattedValue), ChatFormatting.GRAY));
+        }
+    }
+
+    public static void addEnergyConsumption(final double minValue, final double maxValue, final Consumer<Component> tooltip) {
+        final var formattedValue = withFormat(TextFormatUtils.formatNumber(minValue) + "-" + TextFormatUtils.formatNumber(maxValue), ChatFormatting.GREEN);
+        tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_ENERGY_CONSUMPTION, formattedValue), ChatFormatting.GRAY));
+    }
+
+    public static void addDataCorrupted(final ItemStack stack, final Consumer<Component> tooltip) {
+        if (stack.isEmpty()) {
+            return;
+        }
+
+        switch (StorageItemUtils.getState(stack)) {
+            case CORRUPTED -> {
+                tooltip.accept(DATA_CORRUPTED);
+                tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_DATA_CORRUPTED_HINT), ChatFormatting.DARK_GRAY));
+            }
+            case INCONSISTENT -> {
+                tooltip.accept(DATA_INCONSISTENT);
+                tooltip.accept(withFormat(Component.translatable(Constants.TOOLTIP_DATA_INCONSISTENT_HINT), ChatFormatting.DARK_GRAY));
+            }
+            default -> {
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static String[] getDeviceTypeNames() {
+        return StreamSupport.stream(DeviceTypeRegistry.REGISTRY.spliterator(), false).map(DeviceTypeRegistry::key).toArray(String[]::new);
+    }
+
+    private static void collectItemStacks(final CompoundTag tag, final List<ItemStack> stacks, final IntList stackSizes) {
+        final HolderLookup.Provider registries = requireNonNull(Minecraft.getInstance().level).registryAccess();
+        final ListTag itemsTag = tag.getListOrEmpty("Items");
+        for (int i = 0; i < itemsTag.size(); i++) {
+            final CompoundTag itemTag = itemsTag.getCompoundOrEmpty(i);
+            final ItemStack itemStack = NBTUtils.parseItemStack(registries, itemTag);
+            if (itemStack.isEmpty()) {
+                continue;
+            }
+
+            boolean didMerge = false;
+            for (int j = 0; j < stacks.size(); j++) {
+                final ItemStack existingStack = stacks.get(j);
+                if (ItemStack.isSameItemSameComponents(existingStack, itemStack)) {
+                    final int existingCount = stackSizes.getInt(j);
+                    stackSizes.set(j, existingCount + itemStack.getCount());
+                    didMerge = true;
+                    break;
+                }
+            }
+
+            if (!didMerge) {
+                stacks.add(itemStack);
+                stackSizes.add(itemStack.getCount());
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private TooltipUtils() {
+    }
+}

@@ -1,0 +1,195 @@
+# Robot
+
+## High-level API
+Device name: `robot`
+
+Provided by the [robot](../item/robot.md).
+
+### Directions
+The direction parameter in the following methods represents a direction relative to the robot. Valid values are: `forward`, `backward`, `upward`, `downward` for movement actions, `left` and `right` for rotation actions. These directions are always from the point of view of the robot at the time it executes an action.
+
+Short form aliases of these values can be used for convenience: `back`, `up`, `down`. For extreme brevity, the initial letter of each direction can be used as well.
+
+### Sides
+The side parameter of `detect()` represents a face of the robot rather than a movement direction. Valid values are: `front`, `up` and `down`.
+
+### Position
+`getFacing()` reports a compass direction: `north`, `east`, `south` or `west`. `getPosition()` reports where the robot is relative to its origin, in blocks. `x` grows towards east, `y` upward and `z` towards south. The origin is where the robot was placed, until `calibratePosition()` moves it to where the robot is now. The position stays correct however the robot gets moved, pistons included. Breaking the robot clears the origin, changing dimension resets it to the new position.
+
+Note that the `robot` Lua library described in the [robot](../item/robot.md) entry offers useful wrappers for all of these methods. It is recommended to use the library instead of interacting with the device directly.
+
+### Methods
+
+`calibratePosition()`
+Makes the robot's current position its reference origin.
+
+`detect(side:string):string`
+Reports what occupies the space on the specified side of the robot. This only tells you whether the space is free, not what is in it.
+- `side`: the side to look at: `front`, `up` or `down`.
+- Returns `solid` if something there blocks movement, `fluid` if the space holds a fluid the robot can move through, or `air` if the space is free. Blocks the robot can pass through, such as grass, count as `air`.
+
+`getActionResult(actionId:number):string`
+Gets the result of the action with the specified id. Action ids can be obtained from `getLastActionId()`. Only a limited number of past action results are available.
+- `actionId`: the id of the action to get the result for.
+- Returns the result for the specified action id, or nothing if unavailable. When available, possible values are: `INCOMPLETE`, `SUCCESS` and `FAILURE`.
+
+`getEnergyCapacity():number`
+Gets the maximum amount of energy that can be stored in the robot's internal energy storage.
+- Returns the maximum amount of energy stored.
+
+`getEnergyStored():number`
+Gets the current amount of energy stored in the robot's internal energy storage.
+- Returns the stored amount of energy.
+
+`getFacing():string`
+Gets the compass direction the robot is facing.
+- Returns `north`, `east`, `south` or `west`.
+
+`getFluid():table`
+Gets what is in the robot's tank.
+- Returns a description of the fluid in the tank.
+
+`getLastActionId():number`
+Gets the opaque id of the last enqueued action. Call this after a successful `move()` or `turn()` call to obtain the id associated with the enqueued action.
+- Returns the id of the last enqueued action.
+
+`getPosition():table`
+Gets the robot's position relative to its origin.
+- Returns the offset from the origin in `x`, `y` and `z`, in blocks.
+
+`getQueuedActionCount():number`
+Gets the number of actions currently waiting in the action queue to be processed. Use this to wait for actions to finish when enqueueing fails.
+- Returns the number of currently pending actions.
+
+`getSelectedSlot():number`
+Gets the currently selected robot inventory slot. This is used by many modules as an implicit input.
+- Returns the index of the selected inventory slot.
+
+`getStackInSlot(slot:number):table`
+Gets a description of the item in the specified slot.
+- `slot`: the index of the slot to get the item description for.
+- Returns a description of the item in the slot.
+
+`getStatusColor():number`
+Gets the color of the status light on the front of the robot.
+- Returns the current color, as a packed `0xRRGGBB` value.
+
+`getStatusValue():number`
+Gets how far the status light is filled.
+- Returns the current fill value, in the range of [0, 1].
+
+`move(direction:string):boolean`
+Tries to enqueue a movement action in the specified direction.
+- `direction`: the direction to move in: `forward`, `backward`, `upward` or `downward`, or a short form.
+- Returns whether the action was enqueued successfully.
+
+`setSelectedSlot(slot:number):number`
+Sets the currently selected robot inventory slot. This is used by many modules as an implicit input.
+- `slot`: the index of the inventory slot to select.
+- Returns the index of the newly selected slot. This may differ from `slot` if the specified value was invalid.
+
+`setStatusColor(color:number):number`
+Sets the color of the status light on the front of the robot.
+- `color`: the color to set, as a packed `0xRRGGBB` value.
+- Returns the color that was applied.
+
+`setStatusValue(value:number):number`
+Sets how far the status light is filled. It fills from the bottom, so zero hides it entirely and one fills it.
+- `value`: the fill value to set, will be clamped to [0, 1].
+- Returns the fill value that was applied.
+
+`turn(direction:string):boolean`
+Tries to enqueue a turn action towards the specified direction.
+- `direction`: the direction to turn towards: `left` or `right`.
+- Returns whether the action was enqueued successfully.
+
+## Mid-level API
+Device name: `ROBOT`
+
+Directions and sides are numbered. Movement directions are `0` forward, `1` backward, `2` upward and `3` downward. Rotation directions are `0` left and `1` right. Sides for `detect` are `0` front, `1` up and `2` down. Anything outside those ranges fails with `OCEARG`. Facings are `0` north, `1` east, `2` south and `3` west. Item and fluid ids are two bytes, low byte first; [`SYSTEM`](system.md) provides name lookup.
+
+### Events
+`1 actionCompleted` is sent when an action finishes. The value is its id; `getActionResult` tells how it turned out.
+
+### Methods
+
+`1 detect`
+Reports what occupies the space on that side.
+- Takes one byte, the side.
+- Returns one byte: `0` air, `1` fluid, `2` solid. Only `2` stops a move.
+
+`2 getEnergyStored`
+Reads how much energy the robot has left.
+- Returns four bytes, the amount, low byte first.
+
+`3 getEnergyCapacity`
+Reads how much energy the robot holds when full.
+- Returns four bytes, the amount, low byte first.
+
+`4 getSelectedSlot`
+Reads which inventory slot is selected.
+- Returns one byte, the slot.
+
+`5 setSelectedSlot`
+Selects an inventory slot.
+- Takes one byte, the slot. A slot the robot does not have is clamped into range.
+- Returns one byte, the slot in effect after the call.
+
+`6 getStackInSlot`
+Reads what is in an inventory slot.
+- Takes one byte, the slot. A slot the robot does not have fails with `OCEARG`.
+- Returns four bytes, one slot record in the form the `ITEMS` device uses: the item as two bytes, the number of items, and damage.
+
+`7 move`
+Tries to enqueue a movement action in the specified direction.
+- Takes one byte, the direction.
+- Returns one byte, `1` when the action was enqueued, `0` when the queue was full or the robot was not ready.
+
+`8 turn`
+Tries to enqueue a turn action towards the specified direction.
+- Takes one byte, the direction.
+- Returns one byte, `1` when the action was enqueued, `0` when the queue was full or the robot was not ready.
+
+`9 getLastActionId`
+Gets the opaque id of the last enqueued action. Call this after a successful `move` or `turn` call to obtain the id associated with the enqueued action.
+- Returns two bytes, the id, low byte first.
+
+`10 getQueuedActionCount`
+Gets the number of actions currently waiting in the action queue to be processed. Use this to wait for actions to finish when enqueueing fails.
+- Returns one byte, the count.
+
+`11 getActionResult`
+Gets the result of the action with the specified id. Returns `1` until the action finishes. May be awaited using the `actionCompleted` event.
+- Takes two bytes, the id.
+- Returns one byte: `0` unknown, `1` incomplete, `2` success, `3` failure.
+
+`12 getStatusColor`
+Reads the color of the status light.
+- Returns three bytes, the red, green and blue components.
+
+`13 setStatusColor`
+Sets the color of the status light.
+- Takes three bytes, the red, green and blue components.
+
+`14 getStatusValue`
+Reads how far the status light is filled.
+- Returns one byte, the fill value, where `0` is empty and `255` is full.
+
+`15 setStatusValue`
+Sets how far the status light is filled.
+- Takes one byte, the fill value, where `0` is empty and `255` is full.
+
+`16 getFluid`
+Reads what is in the robot's tank.
+- Returns six bytes: the fluid as two bytes and the amount as four bytes. An empty tank reads as fluid 0.
+
+`17 getFacing`
+Gets the compass direction the robot is facing.
+- Returns one byte, the facing.
+
+`18 getPosition`
+Gets the robot's position relative to its origin.
+- Returns six bytes, the signed two byte offsets `x`, `y` and `z`, each low byte first.
+
+`19 calibratePosition`
+Makes the robot's current position its reference origin.

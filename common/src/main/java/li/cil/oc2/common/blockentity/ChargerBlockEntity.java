@@ -1,0 +1,207 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.blockentity;
+
+import li.cil.oc2.api.bus.device.io.IOOutputStream;
+import li.cil.oc2.api.bus.device.object.Callback;
+import li.cil.oc2.api.bus.device.object.IOCallback;
+import li.cil.oc2.api.bus.device.object.IODeviceDescription;
+import li.cil.oc2.api.bus.device.object.RPCDeviceDescription;
+import li.cil.oc2.common.Config;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.energy.EnergyHandler;
+import li.cil.oc2.common.energy.FixedEnergyHandler;
+import li.cil.oc2.common.inventory.ItemHandler;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.message.ChargerStateMessage;
+import li.cil.oc2.common.util.ChunkUtils;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntitySelector;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.util.List;
+import java.util.function.Predicate;
+
+
+@RPCDeviceDescription(typeName = "charger", description = "Provided by the [charger](../block/charger.md) block.")
+@IODeviceDescription(name = "CHARGR")
+public final class ChargerBlockEntity extends ModBlockEntity implements TickableBlockEntity {
+    private static final String HAS_ENERGY_TAG_NAME = "has_energy";
+
+    private static final int IS_CHARGING_CODE = 1;
+    private static final int POWER_ON_DELAY_TICKS = 5;
+
+    private static final Predicate<Entity> ENTITY_PREDICATE =
+        EntitySelector.NO_SPECTATORS
+            .and(EntitySelector.ENTITY_STILL_ALIVE);
+
+    // --------------------------------------------------------------------- //
+
+    private final FixedEnergyHandler energy = new FixedEnergyHandler(Config.chargerEnergyStorage);
+    private boolean isCharging;
+    private boolean hasEnergy;
+    private int ticksWithEnergy;
+    private final AABB renderBoundingBox;
+
+    // --------------------------------------------------------------------- //
+
+    ChargerBlockEntity(final BlockPos pos, final BlockState state) {
+        super(BlockEntities.CHARGER.get(), pos, state);
+        renderBoundingBox = new AABB(pos).expandTowards(0, 1, 0);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public boolean hasEnergy() {
+        return hasEnergy;
+    }
+
+    public void setHasEnergyClient(final boolean value) {
+        hasEnergy = value;
+    }
+
+    @Callback(description = "Gets whether the charger is currently transferring energy to something on top of it.",
+        returnValueDescription = "whether energy is being transferred.")
+    public boolean isCharging() {
+        return isCharging;
+    }
+
+    @IOCallback(value = IS_CHARGING_CODE,
+        description = "Gets whether the charger is currently transferring energy to something on top of it.",
+        resultsDescription = "one byte, `1` if energy is being transferred, `0` otherwise.")
+    public void isCharging(final IOOutputStream results) throws IOException {
+        results.writeU8(isCharging ? 1 : 0);
+    }
+
+    @Override
+    public void serverTick() {
+        if (level == null) {
+            return;
+        }
+
+        if (energy.getEnergyStored() == 0) {
+            ticksWithEnergy = 0;
+        } else if (ticksWithEnergy < POWER_ON_DELAY_TICKS) {
+            ticksWithEnergy++;
+        }
+
+        final boolean hasEnergy = ticksWithEnergy >= POWER_ON_DELAY_TICKS;
+        if (hasEnergy != this.hasEnergy) {
+            this.hasEnergy = hasEnergy;
+            Network.sendToClientsTrackingBlockEntity(new ChargerStateMessage(this, this.hasEnergy), this);
+        }
+
+        isCharging = false;
+        if (hasEnergy) {
+            chargeBlock();
+            chargeEntities();
+        }
+
+        if (isCharging) {
+            ChunkUtils.setLazyUnsaved(level, getBlockPos());
+        }
+    }
+
+    @Override
+    public CompoundTag getUpdateTag(final HolderLookup.Provider registries) {
+        final CompoundTag tag = super.getUpdateTag(registries);
+
+        tag.putBoolean(HAS_ENERGY_TAG_NAME, hasEnergy);
+
+        return tag;
+    }
+
+    @Override
+    protected void saveAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.saveAdditional(tag, registries);
+
+        tag.put(Constants.ENERGY_TAG_NAME, energy.serializeNBT());
+    }
+
+    @Override
+    protected void loadAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.loadAdditional(tag, registries);
+
+        energy.deserializeNBT(tag.getCompoundOrEmpty(Constants.ENERGY_TAG_NAME));
+        hasEnergy = tag.getBooleanOr(HAS_ENERGY_TAG_NAME, false);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void collectCapabilities(final CapabilityCollector collector, @Nullable final Direction direction) {
+        collector.offer(Capabilities.ENERGY_STORAGE, energy);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void chargeBlock() {
+        assert level != null;
+
+        final BlockEntity blockEntity = level.getBlockEntity(getBlockPos().above());
+        if (blockEntity != null) {
+            chargeBlockEntity(blockEntity);
+        }
+    }
+
+    private void chargeEntities() {
+        assert level != null;
+
+        final List<Entity> entities = level.getEntities((Entity) null, new AABB(getBlockPos().above()), ENTITY_PREDICATE);
+        for (final Entity entity : entities) {
+            chargeEntity(entity);
+        }
+    }
+
+    private void chargeBlockEntity(final BlockEntity blockEntity) {
+        charge(Capabilities.get(blockEntity, Capabilities.ENERGY_STORAGE, Direction.DOWN), Capabilities.get(blockEntity, Capabilities.ITEM_HANDLER, Direction.DOWN));
+    }
+
+    private void chargeEntity(final Entity entity) {
+        charge(Capabilities.get(entity, Capabilities.ENERGY_STORAGE, Direction.DOWN), Capabilities.get(entity, Capabilities.ITEM_HANDLER, Direction.DOWN));
+    }
+
+    private void charge(@Nullable EnergyHandler energyHandler, @Nullable ItemHandler itemHandler) {
+        if (energyHandler != null) {
+            chargeStorage(energyHandler);
+        }
+
+        if (itemHandler != null) {
+            chargeItems(itemHandler);
+        }
+    }
+
+    private void chargeStorage(final EnergyHandler energyHandler) {
+        assert level != null;
+
+        final long amount = Math.min(energy.getEnergyStored(), Config.chargerEnergyPerTick);
+        final boolean simulate = level.isClientSide();
+        if (energy.extractEnergy(energyHandler.receiveEnergy(amount, simulate), simulate) > 0) {
+            isCharging = true;
+        }
+    }
+
+    private void chargeItems(final ItemHandler itemHandler) {
+        for (int slot = 0; slot < itemHandler.getSlots(); slot++) {
+            final EnergyHandler stackEnergy = Capabilities.get(itemHandler, slot, Capabilities.ENERGY_STORAGE);
+            if (stackEnergy != null) {
+                chargeStorage(stackEnergy);
+            }
+        }
+    }
+
+    @Nullable
+    @Override
+    public AABB getExpandedRenderBoundingBox() {
+        return renderBoundingBox;
+    }
+}

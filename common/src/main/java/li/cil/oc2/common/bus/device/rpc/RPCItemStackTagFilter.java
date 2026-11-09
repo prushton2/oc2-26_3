@@ -1,0 +1,95 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus.device.rpc;
+
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.Tag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.StringUtil;
+import net.minecraft.world.item.ItemStack;
+
+import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.Objects;
+
+public final class RPCItemStackTagFilter {
+    public Identifier item;
+    public String[] tags;
+
+    private String[][] paths; // Cache of resolved paths specified in tags.
+
+    // --------------------------------------------------------------------- //
+
+    @Nullable
+    public CompoundTag apply(final ItemStack stack, final CompoundTag tag) {
+        if (stack.isEmpty() || tags == null) {
+            return null;
+        }
+
+        if (item != null && !Objects.equals(BuiltInRegistries.ITEM.getKey(stack.getItem()), item)) {
+            return null;
+        }
+
+        validatePaths();
+
+        final CompoundTag filtered = new CompoundTag();
+        for (final String[] path : paths) {
+            final CompoundTag filteredByPath = filterPath(path, tag);
+            if (filteredByPath != null) {
+                filtered.merge(filteredByPath);
+            }
+        }
+
+        return filtered;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Nullable
+    private CompoundTag filterPath(final String[] path, final CompoundTag source) {
+        if (path.length == 0) {
+            return null;
+        }
+
+        final CompoundTag result = new CompoundTag();
+
+        CompoundTag currentSource = source;
+        CompoundTag currentTarget = result;
+        for (int j = 0; j < path.length - 1; j++) {
+            final String segment = path[j];
+            if (currentSource.contains(segment)) {
+                currentSource = currentSource.getCompoundOrEmpty(segment);
+                currentTarget.put(segment, new CompoundTag());
+                currentTarget = currentTarget.getCompoundOrEmpty(segment);
+            } else {
+                return null; // Path mismatch, inner element is not a compound tag.
+            }
+        }
+
+        final Tag tag = currentSource.get(path[path.length - 1]);
+        if (tag == null) {
+            return null; // Cannot find tag at path.
+        }
+
+        currentTarget.put(path[path.length - 1], tag);
+
+        return result;
+    }
+
+    private void validatePaths() {
+        if (paths != null) {
+            return;
+        }
+
+        // Strip out blank (null) entries entirely to avoid NREs later.
+        final ArrayList<String[]> resolved = new ArrayList<>(tags.length);
+        for (final String tag : tags) {
+            if (!StringUtil.isNullOrEmpty(tag)) {
+                resolved.add(tag.split("\\."));
+            }
+        }
+
+        paths = resolved.toArray(new String[0][]);
+    }
+}

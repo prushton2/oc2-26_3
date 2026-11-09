@@ -1,0 +1,11 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": [
+    "oc2:transistor",
+    "oc2:bus_cable"
+  ],
+  "result": {
+    "id": "oc2:bus_interface"
+  }
+}

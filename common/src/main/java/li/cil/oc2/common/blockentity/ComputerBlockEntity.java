@@ -1,0 +1,663 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.blockentity;
+
+import dev.architectury.utils.EnvExecutor;
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.DeviceTypes;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.api.capabilities.TerminalUserProvider;
+import li.cil.oc2.client.audio.LoopingSoundManager;
+import li.cil.oc2.client.audio.TerminalBell;
+import li.cil.oc2.common.Config;
+import li.cil.oc2.common.block.ComputerBlock;
+import li.cil.oc2.common.bus.AbstractBlockDeviceBusElement;
+import li.cil.oc2.common.bus.BlockDeviceBusController;
+import li.cil.oc2.common.bus.CommonDeviceBusController;
+import li.cil.oc2.common.bus.device.util.Devices;
+import li.cil.oc2.common.bus.device.util.NeighborChangeListener;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.capabilities.CapabilityProvider;
+import li.cil.oc2.common.capabilities.CapabilityType;
+import li.cil.oc2.common.capabilities.CompoundNetworkInterface;
+import li.cil.oc2.common.container.ComputerInventoryContainer;
+import li.cil.oc2.common.container.ComputerTerminalContainer;
+import li.cil.oc2.common.energy.FixedEnergyHandler;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.message.*;
+import li.cil.oc2.common.serialization.NBTSerialization;
+import li.cil.oc2.common.util.*;
+import li.cil.oc2.common.util.ComponentJson;
+import li.cil.oc2.common.vm.*;
+import li.cil.oc2.common.vm.arch.AbstractArchitecture;
+import li.cil.oc2.common.vm.device.Terminal;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.SectionPos;
+import net.minecraft.core.UUIDUtil;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ClientboundBlockEntityDataPacket;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.storage.ValueOutput;
+import net.minecraft.world.phys.Vec3;
+
+import javax.annotation.Nullable;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.*;
+
+import static java.util.Objects.requireNonNull;
+import static li.cil.oc2.common.Constants.ITEMS_TAG_NAME;
+
+public final class ComputerBlockEntity extends ModBlockEntity implements TerminalUserProvider, TickableBlockEntity {
+    private static final String BUS_ELEMENT_TAG_NAME = "busElement";
+    private static final String DEVICES_TAG_NAME = "devices";
+    private static final String TERMINAL_TAG_NAME = "terminal";
+    private static final String STATE_TAG_NAME = "state";
+    private static final String ENERGY_TAG_NAME = "energy";
+
+    private static final int CPU_SLOTS = 1;
+    private static final int MEMORY_SLOTS = 4;
+    private static final int HARD_DRIVE_SLOTS = 4;
+    private static final int FLASH_MEMORY_SLOTS = 1;
+    private static final int CARD_SLOTS = 4;
+
+    private static final int MAX_RUNNING_SOUND_DELAY = TickUtils.toTicks(Duration.ofSeconds(2));
+
+    private static final int TERMINAL_RECIPIENT_REFRESH_INTERVAL = TickUtils.toTicks(Duration.ofSeconds(1));
+    private static final double TERMINAL_VIEW_DISTANCE = 8;
+
+    // --------------------------------------------------------------------- //
+
+    private boolean hasAddedOwnDevices;
+    private boolean isNeighborUpdateScheduled;
+    private LevelChunk chunk;
+
+    // --------------------------------------------------------------------- //
+
+    private final Terminal terminal = new Terminal();
+    private final ComputerBusElement busElement = new ComputerBusElement();
+    private final ComputerItemStackHandlers deviceItems = new ComputerItemStackHandlers();
+    private final FixedEnergyHandler energy = new FixedEnergyHandler(Config.computerEnergyStorage);
+    private final ComputerVirtualMachine virtualMachine = new ComputerVirtualMachine(new BlockDeviceBusController(busElement, this::cpuEnergyPerTick, this, deviceItems::getArchitectureType), deviceItems::getDeviceLocation);
+    private final Set<Player> terminalUsers = Collections.newSetFromMap(new WeakHashMap<>());
+    private final List<CapabilityProvider> capabilityProviders = new ArrayList<>();
+    private final List<NeighborChangeListener> neighborChangeListeners = new ArrayList<>();
+    private volatile List<ServerPlayer> terminalRecipients = List.of(); // Players to send live terminal updates to.
+    private int terminalRecipientRefreshCountdown;
+
+    // --------------------------------------------------------------------- //
+
+    public ComputerBlockEntity(final BlockPos pos, final BlockState state) {
+        super(BlockEntities.COMPUTER.get(), pos, state);
+
+        // We want to unload devices even on level unload to free global resources.
+        setNeedsLevelUnloadEvent();
+
+        // Device scan can change our capability set (cards in the computer having capabilities).
+        virtualMachine.getBusController().onAfterDeviceScan.add(this::handleAfterDeviceScan);
+    }
+
+    public Terminal getTerminal() {
+        return terminal;
+    }
+
+    public VirtualMachine getVirtualMachine() {
+        return virtualMachine;
+    }
+
+    public VirtualMachineClientState getVirtualMachineClientState() {
+        return virtualMachine;
+    }
+
+    public VMItemStackHandlers getItemStackHandlers() {
+        return deviceItems;
+    }
+
+    public void start() {
+        if (level != null && !level.isClientSide()) {
+            virtualMachine.start();
+        }
+    }
+
+    public void shutdown() {
+        if (level != null && !level.isClientSide()) {
+            virtualMachine.shutdown();
+        }
+    }
+
+    public void reboot() {
+        if (level != null && !level.isClientSide()) {
+            virtualMachine.reboot();
+        }
+    }
+
+    public void stop() {
+        if (level != null && !level.isClientSide()) {
+            virtualMachine.stop();
+        }
+    }
+
+    public void openTerminalScreen(final ServerPlayer player) {
+        ComputerTerminalContainer.createServer(this, energy, virtualMachine.getBusController(), player);
+    }
+
+    public void openInventoryScreen(final ServerPlayer player) {
+        ComputerInventoryContainer.createServer(this, energy, virtualMachine.getBusController(), player);
+    }
+
+    public void addTerminalUser(final Player player) {
+        terminalUsers.add(player);
+        updateTerminalRecipients();
+    }
+
+    public void removeTerminalUser(final Player player) {
+        terminalUsers.remove(player);
+        updateTerminalRecipients();
+    }
+
+    @Override
+    public Iterable<Player> getTerminalUsers() {
+        final Set<Player> users = new LinkedHashSet<>(terminalUsers);
+        for (final Device device : virtualMachine.getBusController().getDevices()) {
+            if (device instanceof final TerminalUserProvider provider) {
+                provider.getTerminalUsers().forEach(users::add);
+            }
+        }
+
+        return users;
+    }
+
+    public void handleNeighborChanged() {
+        if (level != null && !level.isClientSide()) {
+            virtualMachine.getBusController().scheduleBusScan();
+            for (final NeighborChangeListener listener : neighborChangeListeners) {
+                listener.handleNeighborChanged();
+            }
+        }
+    }
+
+    @Nullable
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T getCapability(final CapabilityType<T> capability, @Nullable final Direction side) {
+        if (!isValid()) {
+            return null;
+        }
+
+        final T own = super.getCapability(capability, side);
+        if (own != null) {
+            return own;
+        }
+
+        final Direction localSide = HorizontalBlockUtils.toLocal(getBlockState(), side);
+        if (capability == Capabilities.NETWORK_INTERFACE) {
+            return (T) CompoundNetworkInterface.of(capabilityProviders, localSide);
+        }
+
+        for (final CapabilityProvider capabilityProvider : capabilityProviders) {
+            final T value = capabilityProvider.getCapability(capability, localSide);
+            if (value != null) {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    @Override
+    public void clientTick() {
+        if (terminal.consumePendingBell()) {
+            TerminalBell.play();
+        }
+    }
+
+    @Override
+    public void serverTick() {
+        if (level == null) {
+            return;
+        }
+
+        // Always add devices provided for the computer itself, even if there's no
+        // adjacent cable. Because that would just be weird.
+        if (!hasAddedOwnDevices) {
+            hasAddedOwnDevices = true;
+            busElement.addOwnDevices();
+        }
+
+        if (isNeighborUpdateScheduled) {
+            isNeighborUpdateScheduled = false;
+            level.updateNeighborsAt(getBlockPos(), getBlockState().getBlock());
+        }
+
+        if (--terminalRecipientRefreshCountdown <= 0) {
+            terminalRecipientRefreshCountdown = TERMINAL_RECIPIENT_REFRESH_INTERVAL;
+            updateTerminalRecipients();
+        }
+
+        final BlockPos blockPos = getBlockPos();
+        final int chunkX = SectionPos.blockToSectionCoord(blockPos.getX());
+        final int chunkZ = SectionPos.blockToSectionCoord(blockPos.getZ());
+        if (chunk == null || chunk.getPos().x() != chunkX || chunk.getPos().z() != chunkZ) {
+            chunk = level.getChunkAt(blockPos);
+        }
+
+        virtualMachine.tick();
+    }
+
+    @Override
+    public CompoundTag getUpdateTag(final HolderLookup.Provider registries) {
+        final CompoundTag tag = super.getUpdateTag(registries);
+
+        synchronized (terminal) {
+            tag.put(TERMINAL_TAG_NAME, NBTSerialization.serialize(terminal));
+        }
+
+        tag.putInt(AbstractVirtualMachine.BUS_STATE_TAG_NAME, virtualMachine.getBusState().ordinal());
+        tag.putInt(AbstractVirtualMachine.RUN_STATE_TAG_NAME, virtualMachine.getRunState().ordinal());
+        final Component bootError = virtualMachine.getBootError();
+        if (bootError != null) {
+            tag.putString(AbstractVirtualMachine.BOOT_ERROR_TAG_NAME, ComponentJson.toJson(bootError, registries));
+        }
+
+        return tag;
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public void removeComponentsFromTag(final ValueOutput output) {
+        output.discard(STATE_TAG_NAME);
+        output.discard(TERMINAL_TAG_NAME);
+        output.discard(ENERGY_TAG_NAME);
+        output.discard(BUS_ELEMENT_TAG_NAME);
+        output.discard(ITEMS_TAG_NAME);
+        output.discard(DEVICES_TAG_NAME);
+    }
+
+    @Override
+    protected void saveAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.saveAdditional(tag, registries);
+
+        if (virtualMachine.getRunState() != VMRunState.STOPPED) {
+            tag.put(STATE_TAG_NAME, virtualMachine.serialize());
+            synchronized (terminal) {
+                tag.put(TERMINAL_TAG_NAME, NBTSerialization.serialize(terminal));
+            }
+        }
+
+        tag.put(ENERGY_TAG_NAME, energy.serializeNBT());
+        tag.put(BUS_ELEMENT_TAG_NAME, busElement.save());
+        tag.put(ITEMS_TAG_NAME, deviceItems.saveItems(registries));
+        tag.put(DEVICES_TAG_NAME, deviceItems.saveDevices());
+    }
+
+    @Override
+    protected void loadAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.loadAdditional(tag, registries);
+
+        energy.deserializeNBT(tag.getCompoundOrEmpty(ENERGY_TAG_NAME));
+        virtualMachine.deserialize(tag.getCompoundOrEmpty(STATE_TAG_NAME));
+        NBTSerialization.deserialize(tag.getCompoundOrEmpty(TERMINAL_TAG_NAME), terminal);
+
+        // Client-visible state, only present in the tag produced by getUpdateTag().
+        if (tag.contains(AbstractVirtualMachine.BUS_STATE_TAG_NAME)) {
+            EnvExecutor.runInEnv(EnvType.CLIENT, () -> () -> {
+                virtualMachine.setBusStateClient(CommonDeviceBusController.BusState.values()[tag.getIntOr(AbstractVirtualMachine.BUS_STATE_TAG_NAME, 0)]);
+                virtualMachine.setRunStateClient(VMRunState.values()[tag.getIntOr(AbstractVirtualMachine.RUN_STATE_TAG_NAME, 0)]);
+                virtualMachine.setBootErrorClient(tag.contains(AbstractVirtualMachine.BOOT_ERROR_TAG_NAME)
+                    ? ComponentJson.fromJson(tag.getStringOr(AbstractVirtualMachine.BOOT_ERROR_TAG_NAME, ""), registries)
+                    : null);
+            });
+        }
+        busElement.load(tag.getCompoundOrEmpty(BUS_ELEMENT_TAG_NAME));
+
+        deviceItems.resetDevices();
+        deviceItems.loadItems(registries, tag.getCompoundOrEmpty(ITEMS_TAG_NAME));
+        deviceItems.loadDevices(tag.getCompoundOrEmpty(DEVICES_TAG_NAME));
+    }
+
+    public void exportToItemStack(final ItemStack stack) {
+        final HolderLookup.Provider registries = requireNonNull(getLevel()).registryAccess();
+        ItemStackUtils.modifyBlockEntityDataTag(stack, getType(), tag -> {
+            deviceItems.saveItems(registries, NBTUtils.getOrCreateChildTag(tag, ITEMS_TAG_NAME));
+            tag.put(ENERGY_TAG_NAME, energy.serializeNBT());
+        });
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void collectCapabilities(final CapabilityCollector collector, @Nullable final Direction direction) {
+        collector.offer(Capabilities.ITEM_HANDLER, deviceItems.combinedItemHandlers);
+        collector.offer(Capabilities.DEVICE_BUS_ELEMENT, busElement);
+        collector.offer(Capabilities.TERMINAL_USER_PROVIDER, this);
+
+        if (Config.computersUseEnergy()) {
+            collector.offer(Capabilities.ENERGY_STORAGE, energy);
+        }
+    }
+
+    @Override
+    protected void loadClient() {
+        super.loadClient();
+
+        terminal.setDisplayOnly(true);
+    }
+
+    @Override
+    protected void loadServer() {
+        super.loadServer();
+
+        assert level != null;
+
+        virtualMachine.setGameTimeSource(LevelUtils.gameTimeSupplier(level));
+    }
+
+    @Override
+    protected void loadServerInLoadedLevel() {
+        super.loadServerInLoadedLevel();
+
+        // For item devices that want a capability from the computer; not available during nbt load yet.
+        deviceItems.updateDevices();
+    }
+
+    @Override
+    protected void unloadServer(final boolean isDestroyed) {
+        super.unloadServer(isDestroyed);
+
+        if (isDestroyed) {
+            virtualMachine.stop();
+        } else {
+            virtualMachine.suspend();
+        }
+
+        virtualMachine.dispose();
+
+        // Just in case, so we don't keep it alive if something holds on to us.
+        chunk = null;
+
+        busElement.dropNeighborHandles();
+
+        // This is necessary in case some other controller found us before our controller
+        // did its scan, which can happen because the scan can happen with a delay. In
+        // that case we don't know that controller and disposing our controller won't
+        // notify it, so we also send out a notification through our bus element, which
+        // would be registered with other controllers in that case.
+        busElement.scheduleScan();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private int cpuEnergyPerTick() {
+        return Config.cpuEnergyPerTick(deviceItems.getArchitectureType().orElse(null));
+    }
+
+    private void updateTerminalRecipients() {
+        if (!(level instanceof final ServerLevel serverLevel)) {
+            return;
+        }
+
+        final Vec3 center = Vec3.atCenterOf(getBlockPos());
+        final Set<ServerPlayer> players = new LinkedHashSet<>();
+        for (final ServerPlayer player : serverLevel.players()) {
+            if (!player.isSpectator() && player.distanceToSqr(center) <= TERMINAL_VIEW_DISTANCE * TERMINAL_VIEW_DISTANCE) {
+                players.add(player);
+            }
+        }
+
+        for (final Player player : terminalUsers) {
+            if (player instanceof final ServerPlayer serverPlayer) {
+                players.add(serverPlayer);
+            }
+        }
+
+        final List<ServerPlayer> previous = terminalRecipients;
+        terminalRecipients = List.copyOf(players);
+
+        for (final ServerPlayer player : terminalRecipients) {
+            if (!previous.contains(player)) {
+                player.connection.send(ClientboundBlockEntityDataPacket.create(this));
+            }
+        }
+    }
+
+    private void sendToTerminalRecipients(final AbstractMessage message) {
+        for (final ServerPlayer player : terminalRecipients) {
+            Network.sendToClient(message, player);
+        }
+    }
+
+    private <T extends AbstractMessage> void sendToClientsTrackingComputer(final T message) {
+        if (chunk != null) {
+            Network.sendToClientsTrackingChunk(message, chunk);
+        }
+    }
+
+    private void handleAfterDeviceScan() {
+        capabilityProviders.clear();
+        neighborChangeListeners.clear();
+        for (final Device device : deviceItems.getDevices()) {
+            if (device instanceof final CapabilityProvider capabilityProvider) {
+                capabilityProviders.add(capabilityProvider);
+            }
+            if (device instanceof final NeighborChangeListener listener) {
+                neighborChangeListeners.add(listener);
+            }
+        }
+
+        if (level != null && !level.isClientSide()) {
+            Capabilities.invalidate(this);
+            for (final NeighborChangeListener listener : neighborChangeListeners) {
+                listener.handleNeighborChanged();
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private final class ComputerItemStackHandlers extends AbstractVMItemStackHandlers {
+        public ComputerItemStackHandlers() {
+            super(
+                new GroupDefinition(DeviceTypes.CPU.get(), CPU_SLOTS),
+                new GroupDefinition(DeviceTypes.MEMORY.get(), MEMORY_SLOTS),
+                new GroupDefinition(DeviceTypes.HARD_DRIVE.get(), HARD_DRIVE_SLOTS),
+                new GroupDefinition(DeviceTypes.FLASH_MEMORY.get(), FLASH_MEMORY_SLOTS),
+                new GroupDefinition(DeviceTypes.CARD.get(), CARD_SLOTS)
+            );
+        }
+
+        @Override
+        protected boolean isClientSide() {
+            return level != null && level.isClientSide();
+        }
+
+        @Override
+        protected ItemDeviceQuery makeQuery(final ItemStack stack) {
+            return Devices.makeQuery(deviceItems.getArchitectureType().orElse(null), ComputerBlockEntity.this, stack);
+        }
+
+        @Override
+        protected void onChanged() {
+            super.onChanged();
+            if (level != null && !level.isClientSide()) {
+                virtualMachine.getBusController().scheduleBusScan();
+                ChunkUtils.setLazyUnsaved(level, getBlockPos());
+            }
+            isNeighborUpdateScheduled = true;
+        }
+    }
+
+    private final class ComputerBusElement extends AbstractBlockDeviceBusElement {
+        private static final String DEVICE_ID_TAG_NAME = "device_id";
+
+        private final HashSet<Device> devices = new HashSet<>();
+        private UUID deviceId = UUID.randomUUID();
+
+        @Nullable
+        @Override
+        public LevelAccessor getLevel() {
+            return ComputerBlockEntity.this.getLevel();
+        }
+
+        @Override
+        public BlockPos getPosition() {
+            return getBlockPos();
+        }
+
+        public void addOwnDevices() {
+            assert level instanceof ServerLevel;
+
+            collectDevices((ServerLevel) level, getPosition(), null).ifPresent(entries -> {
+                for (final BlockEntry info : entries) {
+                    devices.add(info.getDevice());
+                    super.addDevice(info.getDevice());
+                }
+            });
+        }
+
+        @Override
+        public Optional<Collection<DeviceBusElement>> getNeighbors() {
+            return super.getNeighbors().map(neighbors -> {
+                // If we have valid neighbors (complete bus) also add a connection to the bus
+                // element hosting our item devices.
+                final ArrayList<DeviceBusElement> list = new ArrayList<>(neighbors);
+                list.add(deviceItems.busElement);
+                return list;
+            });
+        }
+
+        @Override
+        public boolean canScanContinueTowards(@Nullable final Direction direction) {
+            return getBlockState().getValue(ComputerBlock.FACING) != direction;
+        }
+
+        @Override
+        protected boolean canDetectDevicesTowards(@Nullable final Direction direction) {
+            return direction == null;
+        }
+
+        @Override
+        public Optional<UUID> getDeviceIdentifier(final Device device) {
+            if (devices.contains(device)) {
+                return Optional.of(deviceId);
+            }
+            return super.getDeviceIdentifier(device);
+        }
+
+        @Override
+        public CompoundTag save() {
+            final CompoundTag tag = super.save();
+            tag.store(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC, deviceId);
+            return tag;
+        }
+
+        public void load(final CompoundTag tag) {
+            super.load(tag);
+            if (tag.read(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC).isPresent()) {
+                deviceId = tag.read(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC).orElseThrow();
+            }
+        }
+    }
+
+    private final class ComputerVMRunner extends AbstractTerminalVMRunner {
+        public ComputerVMRunner(final AbstractArchitecture architecture, final Terminal terminal) {
+            super(architecture, terminal);
+        }
+
+        @Override
+        protected void sendTerminalUpdateToClient(final ByteBuffer output) {
+            sendToTerminalRecipients(new ComputerTerminalOutputMessage(ComputerBlockEntity.this, output));
+        }
+    }
+
+    private final class ComputerVirtualMachine extends AbstractVirtualMachine {
+        private ComputerVirtualMachine(final CommonDeviceBusController busController, final DeviceLocationProvider deviceLocationProvider) {
+            super(busController);
+            setDeviceLocationProvider(deviceLocationProvider);
+        }
+
+        @Override
+        @Environment(EnvType.CLIENT)
+        public void setRunStateClient(final VMRunState value) {
+            super.setRunStateClient(value);
+
+            if (value == VMRunState.RUNNING) {
+                if (!LoopingSoundManager.isPlaying(ComputerBlockEntity.this) && level != null) {
+                    LoopingSoundManager.play(ComputerBlockEntity.this, SoundEvents.COMPUTER_RUNNING.get(), level.getRandom().nextInt(MAX_RUNNING_SOUND_DELAY));
+                }
+            } else {
+                LoopingSoundManager.stop(ComputerBlockEntity.this);
+            }
+        }
+
+        @Override
+        public void tick() {
+            assert level != null;
+
+            if (isRunning()) {
+                ChunkUtils.setLazyUnsaved(level, getBlockPos());
+                getBusController().setDeviceContainersChanged();
+            }
+
+            super.tick();
+        }
+
+        @Override
+        protected boolean consumeEnergy(final int amount, final boolean simulate) {
+            if (!Config.computersUseEnergy()) {
+                return true;
+            }
+
+            if (amount > energy.getEnergyStored()) {
+                return false;
+            }
+
+            energy.extractEnergy(amount, simulate);
+            return true;
+        }
+
+        @Override
+        protected void stopRunnerAndReset() {
+            super.stopRunnerAndReset();
+
+            TerminalUtils.resetTerminal(terminal, output -> sendToTerminalRecipients(new ComputerTerminalOutputMessage(ComputerBlockEntity.this, output)));
+        }
+
+        @Override
+        protected AbstractTerminalVMRunner createRunner(final AbstractArchitecture architecture) {
+            return new ComputerVMRunner(architecture, terminal);
+        }
+
+        @Override
+        protected void handleBusStateChanged(final CommonDeviceBusController.BusState value) {
+            sendToClientsTrackingComputer(new ComputerBusStateMessage(ComputerBlockEntity.this, value));
+
+            if (value == CommonDeviceBusController.BusState.READY && level != null) {
+                // Bus just became ready, meaning new devices may be available, meaning new
+                // capabilities may be available, so we need to tell our neighbors.
+                level.updateNeighborsAt(getBlockPos(), getBlockState().getBlock());
+            }
+        }
+
+        @Override
+        protected void handleRunStateChanged(final VMRunState value) {
+            sendToClientsTrackingComputer(new ComputerRunStateMessage(ComputerBlockEntity.this, value));
+        }
+
+        @Override
+        protected void handleBootErrorChanged(@Nullable final Component value) {
+            sendToClientsTrackingComputer(new ComputerBootErrorMessage(ComputerBlockEntity.this, value));
+        }
+    }
+}

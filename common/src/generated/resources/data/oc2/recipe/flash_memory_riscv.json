@@ -1,0 +1,18 @@
+{
+  "type": "oc2:tool",
+  "category": "misc",
+  "ingredients": [
+    "oc2:flash_memory",
+    "oc2:cpu_riscv"
+  ],
+  "result": {
+    "components": {
+      "minecraft:custom_data": {
+        "oc2": {
+          "image": "oc2:block_devices/flash/riscv.bin"
+        }
+      }
+    },
+    "id": "oc2:flash_memory"
+  }
+}

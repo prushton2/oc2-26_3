@@ -1,0 +1,127 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.ItemDevice;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.common.bus.device.TypeNameDevice;
+import li.cil.oc2.common.bus.device.util.Devices;
+import li.cil.oc2.common.bus.device.util.ItemDeviceInfo;
+import li.cil.oc2.common.util.ItemDeviceUtils;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.item.ItemStack;
+
+import java.util.*;
+
+import static li.cil.oc2.common.bus.device.provider.Providers.optionalKey;
+
+public abstract class AbstractItemDeviceBusElement extends AbstractGroupingDeviceBusElement<AbstractItemDeviceBusElement.ItemEntry> {
+    public AbstractItemDeviceBusElement(final int groupCount) {
+        super(groupCount);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public boolean groupContains(final int groupIndex, final Device device) {
+        for (final ItemEntry entry : groups.get(groupIndex)) {
+            if (Objects.equals(entry.getDevice(), device)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public void handleSlotContentsChanged(final int slot, final ItemStack stack) {
+        setEntriesForGroup(slot, collectDevices(stack));
+    }
+
+    public void exportDeviceDataToItemStack(final int slot, final ItemStack stack) {
+        if (stack.isEmpty()) {
+            return;
+        }
+
+        final CompoundTag exportedTag = new CompoundTag();
+        for (final ItemEntry entry : groups.get(slot)) {
+            entry.getDeviceDataKey().ifPresent(key -> {
+                final CompoundTag deviceTag = new CompoundTag();
+                entry.getDevice().exportToItemStack(deviceTag);
+                if (!deviceTag.isEmpty()) {
+                    exportedTag.put(key, deviceTag);
+                }
+            });
+        }
+
+        if (!exportedTag.isEmpty()) {
+            ItemDeviceUtils.setItemDeviceData(stack, exportedTag);
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected abstract ItemDeviceQuery makeQuery(final ItemStack stack);
+
+    protected Set<ItemEntry> collectDevices(final ItemStack stack) {
+        final ItemDeviceQuery query = makeQuery(stack);
+        final HashSet<ItemEntry> entries = new HashSet<>();
+
+        for (final ItemDeviceInfo deviceInfo : Devices.getDevices(query)) {
+            entries.add(new ItemEntry(deviceInfo));
+        }
+
+        collectSyntheticDevices(query, entries);
+
+        importDeviceDataFromItemStack(query, entries);
+
+        return entries;
+    }
+
+    protected void collectSyntheticDevices(final ItemDeviceQuery query, final HashSet<ItemEntry> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+
+        final Identifier registryName = BuiltInRegistries.ITEM.getKey(query.getItemStack().getItem());
+        if (registryName != null) {
+            final String itemName = registryName.toString();
+            entries.add(new ItemEntry(new ItemDeviceInfo(null, new TypeNameDevice(itemName), 0)));
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void importDeviceDataFromItemStack(final ItemDeviceQuery query, final HashSet<ItemEntry> entries) {
+        final CompoundTag exportedTag = ItemDeviceUtils.getItemDeviceData(query.getItemStack());
+        if (!exportedTag.isEmpty()) {
+            for (final ItemEntry entry : entries) {
+                entry.getDeviceDataKey().ifPresent(key -> {
+                    if (exportedTag.contains(key)) {
+                        entry.deviceInfo.device.importFromItemStack(exportedTag.getCompoundOrEmpty(key));
+                    }
+                });
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected record ItemEntry(ItemDeviceInfo deviceInfo) implements Entry {
+        @Override
+        public Optional<String> getDeviceDataKey() {
+            return optionalKey(deviceInfo.provider);
+        }
+
+        @Override
+        public OptionalInt getDeviceEnergyConsumption() {
+            return OptionalInt.of(deviceInfo.getEnergyConsumption());
+        }
+
+        @Override
+        public ItemDevice getDevice() {
+            return deviceInfo.device;
+        }
+    }
+}

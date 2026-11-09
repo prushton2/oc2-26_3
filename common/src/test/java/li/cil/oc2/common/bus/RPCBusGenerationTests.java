@@ -1,0 +1,196 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import li.cil.ceres.BinarySerialization;
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.rpc.RPCDevice;
+import li.cil.sedna.Sedna;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.ByteBuffer;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+public final class RPCBusGenerationTests {
+    private TestSerialDevice serialDevice;
+    private TestSerialDevice blobDevice;
+    private TestSerialDevice eventDevice;
+    private DeviceBusController busController;
+    private RPCDeviceBusAdapter adapter;
+    private Set<Device> devices;
+    private Map<Device, Set<UUID>> identifiers;
+
+    @BeforeEach
+    public void setupEach() {
+        serialDevice = new TestSerialDevice();
+        blobDevice = new TestSerialDevice();
+        eventDevice = new TestSerialDevice();
+        adapter = new RPCDeviceBusAdapter(serialDevice, blobDevice, eventDevice, amount -> true);
+        devices = new HashSet<>();
+        identifiers = new HashMap<>();
+        busController = mock(DeviceBusController.class);
+        when(busController.getDevices()).thenReturn(devices);
+        when(busController.getDeviceIdentifiers(any()))
+            .then(invocation -> identifiers.get(invocation.getArgument(0)));
+    }
+
+    @Test
+    public void generationStableWithoutChanges() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+
+        final int gen = request("list").get("gen").getAsInt();
+        assertEquals(gen, request("list").get("gen").getAsInt(),
+            "repeated list replies must report the same generation");
+    }
+
+    @Test
+    public void everyReplyKindCarriesGeneration() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        final int expected = generation();
+
+        final JsonObject error = request("invoke", "\"data\":{\"deviceId\":\""
+            + UUID.randomUUID() + "\",\"name\":\"nope\",\"parameters\":[]}");
+        assertEquals("error", error.get("type").getAsString());
+        assertEquals(expected, error.get("gen").getAsInt(), "error reply carried the wrong generation");
+
+        final JsonObject methods = request("methods", "\"data\":\"" + onlyIdentifier() + "\"");
+        assertEquals(expected, methods.get("gen").getAsInt(), "methods reply carried the wrong generation");
+    }
+
+    @Test
+    public void resultReplyCarriesGeneration() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        final int expected = generation();
+
+        final JsonObject result = request("invoke", "\"data\":{\"deviceId\":\""
+            + onlyIdentifier() + "\",\"name\":\"ping\",\"parameters\":[]}");
+        assertEquals("result", result.get("type").getAsString(), result.toString());
+        assertEquals(expected, result.get("gen").getAsInt(),
+            "result reply reported a different generation than list");
+    }
+
+    @Test
+    public void generationNeverGoesBackwards() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        int previous = generation();
+
+        for (int i = 0; i < 5; i++) {
+            addDevice("device" + i);
+            adapter.rebuild(busController);
+            final int current = generation();
+            assertTrue(current > previous,
+                "generation must increase monotonically, went " + previous + " -> " + current);
+            previous = current;
+        }
+    }
+
+    @Test
+    public void generationAndDeviceListAgreeInTheSameReply() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        final int before = generation();
+
+        addDevice("inventory");
+        adapter.rebuild(busController);
+
+        final JsonObject reply = request("list");
+        assertNotEquals(before, reply.get("gen").getAsInt());
+        assertEquals(2, reply.getAsJsonArray("data").size(),
+            "new generation was published with a stale device list");
+    }
+
+    @Test
+    public void resetRewindsGeneration() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+
+        adapter.reset();
+
+        assertEquals(0, generation(), "a fresh guest starts at generation 0");
+    }
+
+    @Test
+    public void failedRebuildKeepsGenerationAndAdapter() {
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        final int before = generation();
+
+        doThrow(new IllegalStateException("provider blew up")).when(busController).getDevices();
+        assertThrows(IllegalStateException.class, () -> adapter.rebuild(busController));
+
+        doReturn(devices).when(busController).getDevices();
+        assertEquals("list", request("list").get("type").getAsString(),
+            "the adapter stopped answering after a failed rebuild, so the machine is wedged");
+        assertEquals(before, generation(), "generation moved although the rebuild failed");
+    }
+
+    @Test
+    public void generationSurvivesSaveAndLoad() {
+        Sedna.initialize();
+
+        addDevice("redstone");
+        adapter.rebuild(busController);
+        addDevice("inventory");
+        adapter.rebuild(busController);
+        final int saved = generation();
+        assertTrue(saved > 0, "precondition: the counter has moved off its initial value");
+
+        final ByteBuffer data = BinarySerialization.serialize(adapter);
+
+        final TestSerialDevice restoredSerial = new TestSerialDevice();
+        final RPCDeviceBusAdapter restored = new RPCDeviceBusAdapter(
+            restoredSerial, new TestSerialDevice(), new TestSerialDevice(), amount -> true);
+        BinarySerialization.deserialize(data, restored);
+
+        restoredSerial.putAsVM("{\"type\":\"list\"}");
+        restored.step(0);
+        final String reply = restoredSerial.readMessageAsVM();
+        assertNotNull(reply, "the restored adapter answered nothing");
+        assertEquals(saved, JsonParser.parseString(reply).getAsJsonObject().get("gen").getAsInt(),
+            "the generation did not survive the round trip");
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private int generation() {
+        return request("list").get("gen").getAsInt();
+    }
+
+    private JsonObject request(final String type) {
+        return request(type, null);
+    }
+
+    private JsonObject request(final String type, final String extra) {
+        serialDevice.putAsVM("{\"type\":\"" + type + "\""
+            + (extra == null ? "" : "," + extra) + "}");
+        adapter.step(0);
+        final String message = serialDevice.readMessageAsVM();
+        assertNotNull(message, "no reply to a " + type + " request");
+        return JsonParser.parseString(message).getAsJsonObject();
+    }
+
+    private UUID onlyIdentifier() {
+        return identifiers.values().iterator().next().iterator().next();
+    }
+
+    private void addDevice(final String typeName) {
+        final RPCDevice device = new ObjectDevice(new Pingable(), typeName);
+        devices.add(device);
+        final Set<UUID> ids = new HashSet<>();
+        ids.add(UUID.randomUUID());
+        identifiers.put(device, ids);
+    }
+}

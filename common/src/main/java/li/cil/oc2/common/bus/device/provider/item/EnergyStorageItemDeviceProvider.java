@@ -1,0 +1,25 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus.device.provider.item;
+
+import li.cil.oc2.api.bus.device.ItemDevice;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.common.bus.device.EnergyHandlerDevice;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.energy.EnergyHandler;
+
+import java.util.Optional;
+
+public final class EnergyStorageItemDeviceProvider extends AbstractItemStackCapabilityDeviceProvider<EnergyHandler> {
+    public EnergyStorageItemDeviceProvider() {
+        super(Capabilities.ENERGY_STORAGE);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected Optional<ItemDevice> getItemDevice(final ItemDeviceQuery query, final EnergyHandler value) {
+        return Optional.of(new ObjectDevice(new EnergyHandlerDevice(value)));
+    }
+}

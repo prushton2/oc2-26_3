@@ -1,0 +1,328 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.vm.ArchitectureType;
+import li.cil.oc2.common.util.Event;
+import li.cil.oc2.common.util.ParameterizedEvent;
+import li.cil.oc2.common.util.TickUtils;
+
+import javax.annotation.Nullable;
+import java.time.Duration;
+import java.util.*;
+import java.util.function.IntSupplier;
+import java.util.function.Supplier;
+
+import static java.util.Collections.emptySet;
+
+public class CommonDeviceBusController implements DeviceBusController {
+    public enum BusState {
+        SCAN_PENDING,
+        INCOMPLETE,
+        TOO_COMPLEX,
+        MULTIPLE_CONTROLLERS,
+        READY,
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static final int MAX_BUS_ELEMENT_COUNT = 128;
+    private static final int INCOMPLETE_RETRY_INTERVAL = TickUtils.toTicks(Duration.ofSeconds(10));
+    private static final int BAD_CONFIGURATION_RETRY_INTERVAL = TickUtils.toTicks(Duration.ofSeconds(5));
+
+    // --------------------------------------------------------------------- //
+
+    public final ParameterizedEvent<ArchitectureType> onArchitectureChanged = new ParameterizedEvent<>();
+    public final Event onAfterDeviceScan = new Event();
+    public final Event onSaving = new Event();
+
+    private final DeviceBusElement root;
+    private final Supplier<Optional<ArchitectureType>> architectureType;
+    @Nullable
+    private ArchitectureType lastArchitecture;
+    private final IntSupplier baseEnergyConsumption;
+
+    private final Set<DeviceBusElement> elements = new HashSet<>();
+    private final HashSet<Device> devices = new HashSet<>();
+    private final HashMap<Device, Set<UUID>> deviceIds = new HashMap<>();
+
+    private BusState state = BusState.SCAN_PENDING;
+    private int scanDelay;
+
+    private int energyConsumption;
+
+    // --------------------------------------------------------------------- //
+
+    public CommonDeviceBusController(final DeviceBusElement root, final IntSupplier baseEnergyConsumption,
+                                     final Supplier<Optional<ArchitectureType>> architectureType) {
+        this.root = root;
+        this.architectureType = architectureType;
+        this.baseEnergyConsumption = baseEnergyConsumption;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public void setDeviceContainersChanged() {
+    }
+
+    public void dispose() {
+        for (final DeviceBusElement element : elements) {
+            element.removeController(this);
+
+            // Let other controllers on the bus know we're gone, so they can quickly recover.
+            for (final DeviceBusController controller : element.getControllers()) {
+                controller.scheduleBusScan(ScanReason.BUS_CHANGE);
+            }
+        }
+
+        elements.clear();
+    }
+
+    public BusState getState() {
+        return state;
+    }
+
+    public int getEnergyConsumption() {
+        return energyConsumption;
+    }
+
+    public Optional<ArchitectureType> getArchitectureType() {
+        return architectureType.get();
+    }
+
+    @Override
+    public void scheduleBusScan(final ScanReason reason) {
+        // For notification of a bus error, we just keep our old state and delay, if we have one.
+        // Avoids ping-ponging error states causing scans every tick.
+        if (reason == ScanReason.BUS_ERROR && state.ordinal() < BusState.READY.ordinal()) {
+            return;
+        }
+
+        scanDelay = 0; // scan as soon as possible
+        state = BusState.SCAN_PENDING;
+    }
+
+    @Override
+    public void scanDevices() {
+        final HashSet<Device> newDevices = new HashSet<>();
+        final HashMap<Device, Set<UUID>> newDeviceIds = new HashMap<>();
+        for (final DeviceBusElement element : elements) {
+            for (final Device device : element.getLocalDevices()) {
+                newDevices.add(device);
+                element.getDeviceIdentifier(device).ifPresent(identifier -> newDeviceIds
+                    .computeIfAbsent(device, unused -> new HashSet<>()).add(identifier));
+            }
+        }
+
+        final boolean didDevicesChange = !devices.equals(newDevices);
+        final boolean didDeviceIdsChange = didDevicesChange || deviceIds.entrySet().stream().anyMatch(entry ->
+            !Objects.equals(entry.getValue(), newDeviceIds.get(entry.getKey())));
+
+        if (!didDeviceIdsChange) {
+            return;
+        }
+
+        if (didDevicesChange) {
+            devices.clear();
+            devices.addAll(newDevices);
+        }
+
+        deviceIds.clear();
+        deviceIds.putAll(newDeviceIds);
+
+        onAfterDeviceScan();
+    }
+
+    @Override
+    public Set<Device> getDevices() {
+        return devices;
+    }
+
+    @Override
+    public Set<UUID> getDeviceIdentifiers(final Device device) {
+        return deviceIds.getOrDefault(device, emptySet());
+    }
+
+    public void scan() {
+        if (scanDelay < 0) {
+            return;
+        }
+
+        if (scanDelay-- > 0) {
+            return;
+        }
+
+        assert scanDelay == -1;
+
+        // We stay registered with elements until we scan so that other controllers on the same bus
+        // can detect us in the meantime (for multiple controller detection). This also means that
+        // adapters keep devices mounted until a scan, which is a nice performance plus.
+
+        collectBusElements().ifPresent(addedElements -> {
+            updateElements(addedElements);
+
+            if (checkOtherBusControllers()) {
+                return;
+            }
+
+            updateArchitecture();
+
+            scanDevices();
+
+            updateEnergyConsumption();
+
+            state = BusState.READY;
+
+            onAfterBusScan();
+        });
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected Collection<DeviceBusElement> getElements() {
+        return elements;
+    }
+
+    protected void onArchitectureChanged(@Nullable final ArchitectureType architecture) {
+        onArchitectureChanged.accept(architecture);
+    }
+
+    protected void onAfterDeviceScan() {
+        onAfterDeviceScan.run();
+    }
+
+    protected void onAfterBusScan() {
+    }
+
+    public void onSaving() {
+        onSaving.run();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void clearElements() {
+        for (final DeviceBusElement element : elements) {
+            element.removeController(this);
+        }
+
+        elements.clear();
+
+        scanDevices();
+    }
+
+    private Optional<HashSet<DeviceBusElement>> collectBusElements() {
+        final HashSet<DeviceBusElement> closed = new HashSet<>();
+        final Stack<DeviceBusElement> open = new Stack<>();
+
+        closed.add(root);
+        open.add(root);
+
+        while (!open.isEmpty()) {
+            final DeviceBusElement element = open.pop();
+
+            final Optional<Collection<DeviceBusElement>> elementNeighbors = element.getNeighbors();
+            if (elementNeighbors.isEmpty()) {
+                scanDelay = INCOMPLETE_RETRY_INTERVAL;
+                state = BusState.INCOMPLETE;
+
+                clearElements();
+                return Optional.empty();
+            }
+
+            for (final DeviceBusElement neighbor : elementNeighbors.get()) {
+                if (closed.add(neighbor)) {
+                    open.add(neighbor);
+                }
+            }
+
+            if (closed.size() > MAX_BUS_ELEMENT_COUNT) {
+                scanDelay = BAD_CONFIGURATION_RETRY_INTERVAL;
+                state = BusState.TOO_COMPLEX;
+
+                clearElements();
+                return Optional.empty();
+            }
+        }
+
+        return Optional.of(closed);
+    }
+
+    private void updateArchitecture() {
+        final ArchitectureType currentArchitecture = getArchitectureType().orElse(null);
+        if (currentArchitecture == lastArchitecture) {
+            return;
+        }
+
+        lastArchitecture = currentArchitecture;
+        for (final DeviceBusElement element : elements) {
+            element.invalidateDevices();
+        }
+
+        onArchitectureChanged(currentArchitecture);
+    }
+
+    private void updateElements(final Set<DeviceBusElement> newElements) {
+        final HashSet<DeviceBusElement> removedElements = new HashSet<>(elements);
+        removedElements.removeAll(newElements);
+
+        elements.removeAll(removedElements);
+
+        for (final DeviceBusElement removedElement : removedElements) {
+            removedElement.removeController(this);
+
+            // Let other controllers on the bus know we're gone, so they can quickly recover.
+            for (final DeviceBusController controller : removedElement.getControllers()) {
+                controller.scheduleBusScan(ScanReason.BUS_CHANGE);
+            }
+        }
+
+        final HashSet<DeviceBusElement> addedElements = new HashSet<>(newElements);
+        addedElements.removeAll(elements);
+
+        elements.addAll(addedElements);
+
+        for (final DeviceBusElement element : addedElements) {
+            element.addController(this);
+        }
+    }
+
+    private boolean checkOtherBusControllers() {
+        final HashSet<DeviceBusController> controllers = new HashSet<>();
+        for (final DeviceBusElement element : elements) {
+            controllers.addAll(element.getControllers());
+        }
+
+        controllers.remove(this);
+
+        if (controllers.isEmpty()) {
+            return false;
+        }
+
+        // If there's any controllers on the bus that are not this one, enter error state and
+        // trigger a scan for those controllers, too, so they may enter error state.
+
+        for (final DeviceBusController controller : controllers) {
+            controller.scheduleBusScan(ScanReason.BUS_ERROR);
+        }
+
+        state = BusState.MULTIPLE_CONTROLLERS;
+        scanDelay = BAD_CONFIGURATION_RETRY_INTERVAL;
+        return true;
+    }
+
+    private void updateEnergyConsumption() {
+        double accumulator = baseEnergyConsumption.getAsInt();
+        for (final DeviceBusElement element : elements) {
+            accumulator += Math.max(0, element.getEnergyConsumption());
+        }
+
+        if (accumulator > Integer.MAX_VALUE) {
+            energyConsumption = Integer.MAX_VALUE;
+        } else {
+            energyConsumption = (int) Math.ceil(accumulator);
+        }
+    }
+}

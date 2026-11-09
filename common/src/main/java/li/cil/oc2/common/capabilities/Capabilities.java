@@ -1,0 +1,130 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.capabilities;
+
+import dev.architectury.injectables.annotations.ExpectPlatform;
+import li.cil.oc2.api.API;
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.capabilities.NetworkInterface;
+import li.cil.oc2.api.capabilities.RedstoneEmitter;
+import li.cil.oc2.api.capabilities.Robot;
+import li.cil.oc2.api.capabilities.TerminalUserProvider;
+import li.cil.oc2.common.energy.EnergyHandler;
+import li.cil.oc2.common.fluid.FluidHandler;
+import li.cil.oc2.common.inventory.ItemHandler;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.phys.AABB;
+
+import javax.annotation.Nullable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+public final class Capabilities {
+    @FunctionalInterface
+    public interface InvalidationHandle {
+        void drop();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    // Interop capabilities
+    public static final CapabilityType<EnergyHandler> ENERGY_STORAGE = type("energy_storage", EnergyHandler.class);
+    public static final CapabilityType<ItemHandler> ITEM_HANDLER = type("item_handler", ItemHandler.class);
+    public static final CapabilityType<FluidHandler> FLUID_HANDLER = type("fluid_handler", FluidHandler.class);
+
+    // Owned capabilities
+    public static final CapabilityType<DeviceBusElement> DEVICE_BUS_ELEMENT = type("device_bus_element", DeviceBusElement.class);
+    public static final CapabilityType<Device> DEVICE = type("device", Device.class);
+    public static final CapabilityType<RedstoneEmitter> REDSTONE_EMITTER = type("redstone_emitter", RedstoneEmitter.class);
+    public static final CapabilityType<NetworkInterface> NETWORK_INTERFACE = type("network_interface", NetworkInterface.class);
+    public static final CapabilityType<TerminalUserProvider> TERMINAL_USER_PROVIDER = type("terminal_user_provider", TerminalUserProvider.class);
+    public static final CapabilityType<Robot> ROBOT = type("robot", Robot.class);
+
+    // --------------------------------------------------------------------- //
+
+    @ExpectPlatform
+    @Nullable
+    public static <T> T get(final Level level, final BlockPos pos, final CapabilityType<T> type, @Nullable final Direction side) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    @Nullable
+    public static <T> T get(final BlockEntity blockEntity, final CapabilityType<T> type, @Nullable final Direction side) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    @Nullable
+    public static <T> T get(final ItemStack stack, final CapabilityType<T> type) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    @Nullable
+    public static <T> T get(final ItemHandler handler, final int slot, final CapabilityType<T> type) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    @Nullable
+    public static <T> T get(final Entity entity, final CapabilityType<T> type, @Nullable final Direction side) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    public static <T> Optional<CapabilityCache<T>> cache(final ServerLevel level, final BlockPos pos, @Nullable final Direction side,
+                                                         final CapabilityType<T> type) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    public static InvalidationHandle listen(final ServerLevel level, final BlockPos pos, final Runnable callback) {
+        throw new AssertionError();
+    }
+
+    @ExpectPlatform
+    public static void invalidate(final BlockEntity blockEntity) {
+        throw new AssertionError();
+    }
+
+    public static <T> List<T> getAll(final ServerLevel level, final BlockPos pos, final CapabilityType<T> type,
+                                     final Direction side, @Nullable final Entity except) {
+        final List<T> values = new ArrayList<>();
+        if (!level.isLoaded(pos)) {
+            return values;
+        }
+
+        for (final Entity entity : level.getEntities(except, new AABB(pos))) {
+            final T value = get(entity, type, side);
+            if (value != null) {
+                values.add(value);
+            }
+        }
+
+        final T value = get(level, pos, type, side);
+        if (value != null) {
+            values.add(value);
+        }
+
+        return values;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static <T> CapabilityType<T> type(final String name, final Class<T> type) {
+        return new CapabilityType<>(Identifier.fromNamespaceAndPath(API.MOD_ID, name), type);
+    }
+
+    private Capabilities() {
+    }
+}

@@ -1,0 +1,467 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus.device.storage;
+
+import com.google.common.eventbus.Subscribe;
+import li.cil.oc2.api.bus.device.vm.VMDevice;
+import li.cil.oc2.api.bus.device.vm.VMDeviceLoadResult;
+import li.cil.oc2.api.bus.device.vm.context.VMContext;
+import li.cil.oc2.api.bus.device.vm.context.VMRuntime;
+import li.cil.oc2.api.bus.device.vm.event.VMResumedRunningEvent;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.bus.device.util.IdentityProxy;
+import li.cil.oc2.common.bus.device.util.OptionalAddress;
+import li.cil.oc2.common.bus.device.util.OptionalInterrupt;
+import li.cil.oc2.common.serialization.BlobReference;
+import li.cil.oc2.common.serialization.BlobStorage;
+import li.cil.oc2.common.serialization.NBTSerialization;
+import li.cil.oc2.common.util.Event;
+import li.cil.oc2.common.util.StorageItemUtils;
+import li.cil.oc2.common.util.StorageItemUtils.State;
+import li.cil.sedna.api.device.BlockDevice;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.ItemStack;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+public abstract class AbstractBlockStorageDevice<TBlock extends BlockDevice, TIdentity> extends IdentityProxy<TIdentity> implements VMDevice {
+    protected static final Logger LOGGER = LogManager.getLogger(AbstractBlockStorageDevice.class);
+
+    private static final String DEVICE_TAG_NAME = "device";
+    private static final String ADDRESS_TAG_NAME = "address";
+    private static final String INTERRUPT_TAG_NAME = "interrupt";
+
+    protected static final ExecutorService WORKERS = Executors.newFixedThreadPool(
+        Math.max(1, Runtime.getRuntime().availableProcessors()), r -> {
+            final Thread thread = new Thread(r, "Block Device Initializer");
+            thread.setDaemon(true);
+            return thread;
+        });
+
+    // --------------------------------------------------------------------- //
+
+    protected boolean readonly;
+    @Nullable
+    protected MappedStorage storage;
+    @Nullable
+    protected VMRuntime runtime;
+    private volatile CompletableFuture<Void> openJob;
+
+    // --------------------------------------------------------------------- //
+
+    // Online persisted data.
+    private final OptionalAddress address = new OptionalAddress();
+    private final OptionalInterrupt interrupt = new OptionalInterrupt();
+    private CompoundTag deviceTag;
+
+    // Offline persisted data.
+    protected final BlobReference blob = new BlobReference();
+
+    // --------------------------------------------------------------------- //
+
+    protected AbstractBlockStorageDevice(final TIdentity identity, final boolean readonly) {
+        super(identity);
+        this.readonly = readonly;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public void exportToItemStack(final CompoundTag tag) {
+        blob.writeTo(tag);
+    }
+
+    public void importFromItemStack(final CompoundTag tag) {
+        blob.readFrom(tag);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public VMDeviceLoadResult mount(final VMContext context) {
+        runtime = context.getRuntime();
+
+        if (allocateDevice(context) instanceof AllocationFailure(Component message, boolean permanent)) {
+            var result = failMount();
+            if (message != null) {
+                result = result.withErrorMessage(message);
+            }
+            return permanent ? result.asPermanent() : result;
+        }
+
+        assert storage != null;
+        final VMDeviceLoadResult claim = storage.claim(context, address, interrupt);
+        if (!claim.wasSuccessful()) {
+            releaseOnFailure();
+            return claim.asPermanent();
+        }
+
+        context.getEventBus().register(this);
+
+        if (deviceTag != null) {
+            NBTSerialization.deserialize(deviceTag, storage.getDevice());
+        }
+
+        return VMDeviceLoadResult.success();
+    }
+
+    @Override
+    public void unmount() {
+        if (storage != null) {
+            deviceTag = NBTSerialization.serialize(storage.getDevice());
+        }
+
+        closeDevice();
+        blob.close();
+        runtime = null;
+    }
+
+    @Override
+    public void dispose() {
+        deviceTag = null;
+        address.clear();
+        interrupt.clear();
+    }
+
+    @Override
+    public CompoundTag serializeNBT() {
+        joinOpenJob();
+
+        final CompoundTag tag = new CompoundTag();
+
+        blob.writeTo(tag);
+
+        if (storage != null) {
+            deviceTag = NBTSerialization.serialize(storage.getDevice());
+        }
+        if (deviceTag != null) {
+            tag.put(DEVICE_TAG_NAME, deviceTag);
+        }
+        if (address.isPresent()) {
+            tag.putLong(ADDRESS_TAG_NAME, address.getAsLong());
+        }
+        if (interrupt.isPresent()) {
+            tag.putInt(INTERRUPT_TAG_NAME, interrupt.getAsInt());
+        }
+
+        return tag;
+    }
+
+    @Override
+    public void deserializeNBT(final CompoundTag tag) {
+        blob.readFrom(tag);
+
+        if (tag.contains(DEVICE_TAG_NAME)) {
+            deviceTag = tag.getCompoundOrEmpty(DEVICE_TAG_NAME);
+        }
+        if (tag.contains(ADDRESS_TAG_NAME)) {
+            address.set(tag.getLongOr(ADDRESS_TAG_NAME, 0L));
+        }
+        if (tag.contains(INTERRUPT_TAG_NAME)) {
+            interrupt.set(tag.getIntOr(INTERRUPT_TAG_NAME, 0));
+        }
+    }
+
+    @Subscribe
+    public void handleResumedRunningEvent(final VMResumedRunningEvent event) {
+        joinOpenJob();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected void setOpenJob(final CompletableFuture<Void> job) {
+        joinOpenJob();
+        openJob = job;
+    }
+
+    protected void joinOpenJob() {
+        if (openJob != null) {
+            try {
+                openJob.join();
+            } catch (final CompletionException e) {
+                LOGGER.error(e);
+            } finally {
+                openJob = null;
+            }
+        }
+    }
+
+    protected abstract int getMappedByteCount();
+
+    protected abstract CompletableFuture<TBlock> createBlockDevice() throws IOException;
+
+    protected void setBlockDevice(final BlockDevice blockDevice) throws IOException {
+        assert storage != null;
+        storage.setBlockDevice(withAccessListener(blockDevice), false);
+    }
+
+    protected MappedStorage createStorage(final VMContext context) {
+        return new VirtIOStorage(context, readonly);
+    }
+
+    protected void handleDataAccess() {
+    }
+
+    protected abstract ItemStack getStorageItem();
+
+    protected void handleStorageChanged() {
+    }
+
+    protected void handleDataUnavailable() {
+        StorageItemUtils.setState(getStorageItem(), State.CORRUPTED);
+        handleStorageChanged();
+    }
+
+    protected boolean handleDataStale() {
+        final boolean isAccepted = StorageItemUtils.acceptStaleData(getStorageItem());
+        handleStorageChanged();
+        return isAccepted;
+    }
+
+    protected final BlockDevice withAccessListener(final BlockDevice block) {
+        final ListenableBlockDevice listenable = new ListenableBlockDevice(block);
+        listenable.onAccess.add(this::handleDataAccess);
+        return listenable;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private AllocationResult allocateDevice(final VMContext context) {
+        final long claim = (long) Constants.PAGE_SIZE + getMappedByteCount();
+        if (!context.getMemoryAllocator().claimMemory((int) Math.min(Integer.MAX_VALUE, claim))) {
+            return new AllocationFailure(true);
+        }
+
+        if (blob.isStale() && !handleDataStale()) {
+            return new AllocationFailure(Component.translatable(Constants.COMPUTER_ERROR_STORAGE_INCONSISTENT), true);
+        }
+
+        storage = createStorage(context);
+
+        final CompletableFuture<TBlock> job;
+        try {
+            job = createBlockDevice();
+        } catch (final BlobStorage.BlobStorageFullException e) {
+            LOGGER.error(e);
+            return new AllocationFailure(Component.translatable(Constants.COMPUTER_ERROR_STORAGE_FULL), false);
+        } catch (final BlobStorage.BlobMissingException | BlobStorage.BlobInUseException e) {
+            handleDataUnavailable();
+            return new AllocationFailure(Component.translatable(Constants.COMPUTER_ERROR_STORAGE_CORRUPTED), true);
+        } catch (final IOException e) {
+            LOGGER.error(e);
+            return new AllocationFailure(false);
+        }
+
+        setOpenJob(job.thenAcceptAsync(blockDevice -> {
+            try {
+                setBlockDevice(blockDevice);
+            } catch (final IOException e) {
+                throw new RuntimeException(e);
+            }
+        }, WORKERS));
+
+        return new AllocationSuccess();
+    }
+
+    private void closeDevice() {
+        // Join the init job before releasing the device to avoid writes from thread to closed device.
+        // Since we use memory mapped memory, closing the device leads to it holding a dead pointer,
+        // meaning further access to it will hard-crash the JVM.
+        joinOpenJob();
+
+        if (storage == null) {
+            return;
+        }
+
+        try {
+            storage.close();
+        } catch (final IOException e) {
+            LOGGER.error(e);
+        }
+
+        storage = null;
+    }
+
+    private VMDeviceLoadResult failMount() {
+        releaseOnFailure();
+        return VMDeviceLoadResult.fail();
+    }
+
+    private void releaseOnFailure() {
+        closeDevice();
+        blob.close();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private sealed interface AllocationResult permits AllocationSuccess, AllocationFailure {
+    }
+
+    private record AllocationSuccess() implements AllocationResult {
+    }
+
+    private record AllocationFailure(@Nullable Component message, boolean permanent) implements AllocationResult {
+        public AllocationFailure(final boolean permanent) {
+            this(null, permanent);
+        }
+    }
+
+    private static final class ListenableBlockDevice implements BlockDevice {
+        private final BlockDevice inner;
+
+        public final Event onAccess = new Event();
+
+        private ListenableBlockDevice(final BlockDevice inner) {
+            this.inner = inner;
+        }
+
+        @Override
+        public boolean isReadonly() {
+            return inner.isReadonly();
+        }
+
+        @Override
+        public long getCapacity() {
+            return inner.getCapacity();
+        }
+
+        @Override
+        public InputStream getInputStream(final long offset) {
+            final ListenableInputStream stream = new ListenableInputStream(inner.getInputStream(offset));
+            stream.onAccess.add(onAccess);
+            return stream;
+        }
+
+        @Override
+        public OutputStream getOutputStream(final long offset) {
+            final ListenableOutputStream stream = new ListenableOutputStream(inner.getOutputStream(offset));
+            stream.onAccess.add(onAccess);
+            return stream;
+        }
+
+        @Override
+        public void flush() {
+            inner.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            inner.close();
+        }
+    }
+
+    private static final class ListenableInputStream extends InputStream {
+        private final InputStream inner;
+
+        public final Event onAccess = new Event();
+
+        private ListenableInputStream(final InputStream inner) {
+            this.inner = inner;
+        }
+
+        @Override
+        public int read() throws IOException {
+            onAccess();
+            return inner.read();
+        }
+
+        @Override
+        public int read(final byte[] b) throws IOException {
+            onAccess();
+            return inner.read(b);
+        }
+
+        @Override
+        public int read(final byte[] b, final int off, final int len) throws IOException {
+            onAccess();
+            return inner.read(b, off, len);
+        }
+
+        @Override
+        public long skip(final long n) throws IOException {
+            onAccess();
+            return inner.skip(n);
+        }
+
+        @Override
+        public int available() throws IOException {
+            return inner.available();
+        }
+
+        @Override
+        public void close() throws IOException {
+            inner.close();
+        }
+
+        @Override
+        public synchronized void mark(final int limit) {
+            inner.mark(limit);
+        }
+
+        @Override
+        public synchronized void reset() throws IOException {
+            onAccess();
+            inner.reset();
+        }
+
+        @Override
+        public boolean markSupported() {
+            return inner.markSupported();
+        }
+
+        private void onAccess() {
+            onAccess.run();
+        }
+    }
+
+    private static final class ListenableOutputStream extends OutputStream {
+        private final OutputStream inner;
+
+        public final Event onAccess = new Event();
+
+        private ListenableOutputStream(final OutputStream inner) {
+            this.inner = inner;
+        }
+
+        @Override
+        public void write(final int b) throws IOException {
+            onAccess();
+            inner.write(b);
+        }
+
+        @Override
+        public void write(final byte[] b) throws IOException {
+            onAccess();
+            inner.write(b);
+        }
+
+        @Override
+        public void write(final byte[] b, final int off, final int len) throws IOException {
+            onAccess();
+            inner.write(b, off, len);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            inner.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            inner.close();
+        }
+
+        private void onAccess() {
+            onAccess.run();
+        }
+    }
+}

@@ -1,0 +1,143 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.api.bus.device.object;
+
+import li.cil.oc2.api.bus.device.ItemDevice;
+import li.cil.oc2.api.bus.device.io.IOBusContext;
+import li.cil.oc2.api.bus.device.io.IODevice;
+import li.cil.oc2.api.bus.device.io.IOMethod;
+import li.cil.oc2.api.bus.device.rpc.RPCBusContext;
+import li.cil.oc2.api.bus.device.rpc.RPCDevice;
+import li.cil.oc2.api.bus.device.rpc.RPCMethod;
+import li.cil.oc2.api.bus.device.rpc.RPCMethodGroup;
+
+import javax.annotation.Nullable;
+import java.util.List;
+
+/**
+ * A reflection based implementation of {@link RPCDevice} using the {@link Callback}
+ * annotation to discover {@link RPCMethod}s in a target object via
+ * {@link Callbacks#collectMethods(Object)}, and equally of {@link IODevice} using the {@link IOCallback}
+ * annotation to discover {@link IOMethod}s in a target object via
+ * {@link IOCallbacks#collectMethods(Object)}.
+ */
+public final class ObjectDevice implements RPCDevice, IODevice, ItemDevice {
+    private final Object object;
+    private final String typeName;
+    private final List<RPCMethodGroup> rpcMethods;
+    private final String className;
+    private final List<IOMethod> ioMethods;
+    private final String ioName;
+
+    // --------------------------------------------------------------------- //
+
+    /**
+     * Creates a new object device with methods in the specified object and the specified
+     * type name. For convenience, the type name may be {@code null}, in which case using
+     * this constructor is equivalent to using {@link #ObjectDevice(Object)}.
+     *
+     * @param object   the object containing methods provided by this device.
+     * @param typeName the type name of the device.
+     */
+    public ObjectDevice(final Object object, @Nullable final String typeName) {
+        this.object = object;
+        this.typeName = typeName != null ? typeName : Callbacks.getTypeName(object);
+        this.rpcMethods = Callbacks.collectMethods(object);
+        this.className = object.getClass().getSimpleName();
+        this.ioMethods = IOCallbacks.collectMethods(object);
+        this.ioName = ioMethods.isEmpty() ? "" : IOCallbacks.getName(object);
+    }
+
+    /**
+     * Creates a new object device with methods in the specified object and no explicit type name.
+     * <p>
+     * The type name is then taken from the object, see {@link Callbacks#getTypeName(Object)}.
+     *
+     * @param object the object containing the methods provided by this device.
+     */
+    public ObjectDevice(final Object object) {
+        this(object, null);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public String getTypeName() {
+        return typeName;
+    }
+
+    @Override
+    public List<RPCMethodGroup> getMethodGroups() {
+        return rpcMethods;
+    }
+
+    @Override
+    public void mount(final RPCBusContext context) {
+        if (object instanceof LifecycleAwareDevice device) {
+            device.onDeviceMounted(context);
+        }
+    }
+
+    @Override
+    public void unmount(final RPCBusContext context) {
+        if (object instanceof LifecycleAwareDevice device) {
+            device.onDeviceUnmounted(context);
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public String getIOName() {
+        return ioName;
+    }
+
+    @Override
+    public List<IOMethod> getIOMethods() {
+        return ioMethods;
+    }
+
+    @Override
+    public void mountIO(final IOBusContext context) {
+        if (object instanceof LifecycleAwareDevice device) {
+            device.onIODeviceMounted(context);
+        }
+    }
+
+    @Override
+    public void unmountIO(final IOBusContext context) {
+        if (object instanceof LifecycleAwareDevice device) {
+            device.onIODeviceUnmounted(context);
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public void dispose() {
+        if (object instanceof LifecycleAwareDevice device) {
+            device.onDeviceDisposed();
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public boolean equals(@Nullable final Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        final ObjectDevice that = (ObjectDevice) o;
+        return object.equals(that.object);
+    }
+
+    @Override
+    public int hashCode() {
+        return object.hashCode();
+    }
+
+    @Override
+    public String toString() {
+        return className;
+    }
+
+}

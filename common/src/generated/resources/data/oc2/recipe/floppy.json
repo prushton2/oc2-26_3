@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": "oc2:circuit_board",
+    "Q": "#c:gems/quartz",
+    "R": "#c:dusts/redstone",
+    "T": "oc2:transistor"
+  },
+  "pattern": [
+    "QTQ",
+    "RBR"
+  ],
+  "result": {
+    "id": "oc2:floppy"
+  }
+}

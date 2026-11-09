@@ -1,0 +1,81 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus.device.item;
+
+import li.cil.oc2.api.bus.device.ItemDevice;
+import li.cil.oc2.api.bus.device.io.IOBusContext;
+import li.cil.oc2.api.bus.device.io.IODevice;
+import li.cil.oc2.api.bus.device.io.IOMethod;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.rpc.RPCBusContext;
+import li.cil.oc2.api.bus.device.rpc.RPCDevice;
+import li.cil.oc2.api.bus.device.rpc.RPCMethodGroup;
+import li.cil.oc2.common.bus.device.util.IdentityProxy;
+import net.minecraft.world.item.ItemStack;
+
+import java.util.List;
+
+public abstract class AbstractItemDevice extends IdentityProxy<ItemStack> implements RPCDevice, IODevice, ItemDevice {
+    private final ObjectDevice device;
+
+    // --------------------------------------------------------------------- //
+
+    protected AbstractItemDevice(final ItemStack identity) {
+        super(identity);
+        this.device = new ObjectDevice(this);
+    }
+
+    protected AbstractItemDevice(final ItemStack identity, final Object target) {
+        super(identity);
+        this.device = new ObjectDevice(target);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public String getTypeName() {
+        return device.getTypeName();
+    }
+
+    @Override
+    public List<RPCMethodGroup> getMethodGroups() {
+        return device.getMethodGroups();
+    }
+
+    @Override
+    public void mount(final RPCBusContext context) {
+        device.mount(context);
+    }
+
+    @Override
+    public void unmount(final RPCBusContext context) {
+        device.unmount(context);
+    }
+
+    @Override
+    public void dispose() {
+        device.dispose();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public String getIOName() {
+        return device.getIOName();
+    }
+
+    @Override
+    public List<IOMethod> getIOMethods() {
+        return device.getIOMethods();
+    }
+
+    @Override
+    public void mountIO(final IOBusContext context) {
+        device.mountIO(context);
+    }
+
+    @Override
+    public void unmountIO(final IOBusContext context) {
+        device.unmountIO(context);
+    }
+}

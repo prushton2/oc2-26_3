@@ -1,0 +1,49 @@
+{
+  "textures": {
+    "glow": "oc2:block/overlay/transposer_glow",
+    "particle": "#glow"
+  },
+  "elements": [
+    {
+      "from": [
+        0.5,
+        0.5,
+        0.5
+      ],
+      "to": [
+        15.5,
+        15.5,
+        15.5
+      ],
+      "shade": false,
+      "faces": {
+        "down": {
+          "texture": "#glow",
+          "cullface": "down"
+        },
+        "up": {
+          "texture": "#glow",
+          "cullface": "up"
+        },
+        "north": {
+          "texture": "#glow",
+          "cullface": "north"
+        },
+        "south": {
+          "texture": "#glow",
+          "cullface": "south"
+        },
+        "west": {
+          "texture": "#glow",
+          "cullface": "west"
+        },
+        "east": {
+          "texture": "#glow",
+          "cullface": "east"
+        }
+      },
+      "light_emission": 15
+    }
+  ],
+  "ambientocclusion": false
+}

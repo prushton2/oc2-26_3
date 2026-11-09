@@ -1,0 +1,32 @@
+{
+  "parent": "minecraft:recipes/root",
+  "criteria": {
+    "has_flash_memory": {
+      "conditions": {
+        "items": [
+          {
+            "items": "oc2:flash_memory"
+          }
+        ]
+      },
+      "trigger": "minecraft:inventory_changed"
+    },
+    "has_the_recipe": {
+      "conditions": {
+        "recipes": "oc2:flash_memory_erase"
+      },
+      "trigger": "minecraft:recipe_unlocked"
+    }
+  },
+  "requirements": [
+    [
+      "has_the_recipe",
+      "has_flash_memory"
+    ]
+  ],
+  "rewards": {
+    "recipes": [
+      "oc2:flash_memory_erase"
+    ]
+  }
+}

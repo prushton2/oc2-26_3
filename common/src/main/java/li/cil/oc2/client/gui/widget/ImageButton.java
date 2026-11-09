@@ -1,0 +1,128 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.client.gui.widget;
+
+import li.cil.oc2.client.gui.util.TooltipRenderer;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.gui.components.AbstractButton;
+import net.minecraft.client.gui.narration.NarrationElementOutput;
+import net.minecraft.client.input.InputWithModifiers;
+import net.minecraft.network.chat.CommonComponents;
+import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
+
+import java.util.Arrays;
+import java.util.List;
+import java.util.Objects;
+
+import static java.util.Collections.emptyList;
+import static li.cil.oc2.common.util.TextFormatUtils.withFormat;
+
+public abstract class ImageButton extends AbstractButton {
+    private static final long PRESS_DURATION = 200;
+    private static final long TOOLTIP_DELAY = 250;
+
+    // --------------------------------------------------------------------- //
+
+    private final Background baseImage;
+    private final Background pressedImage;
+    private List<Component> tooltip = emptyList();
+    private long lastPressedAt;
+    private long hoveringStartedAt;
+
+    // --------------------------------------------------------------------- //
+
+    protected ImageButton(final int x, final int y, final int width, final int height, final Sprite baseImage, final Sprite pressedImage) {
+        this(x, y, width, height,
+            (graphics, bx, by, bw, bh) -> baseImage.draw(graphics, bx, by),
+            (graphics, bx, by, bw, bh) -> pressedImage.draw(graphics, bx, by));
+    }
+
+    protected ImageButton(final int x, final int y, final int width, final int height, final NineSliceSprite baseImage, final NineSliceSprite pressedImage) {
+        this(x, y, width, height, baseImage::draw, pressedImage::draw);
+    }
+
+    private ImageButton(final int x, final int y, final int width, final int height, final Background baseImage, final Background pressedImage) {
+        super(x, y, width, height, CommonComponents.EMPTY);
+        this.baseImage = baseImage;
+        this.pressedImage = pressedImage;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public ImageButton withMessage(final Component component) {
+        setMessage(component);
+        return this;
+    }
+
+    public ImageButton withTooltip(final Component... components) {
+        tooltip = Arrays.asList(components);
+        for (int i = 1; i < tooltip.size(); i++) {
+            final Component component = tooltip.get(i);
+            tooltip.set(i, withFormat(component, ChatFormatting.GRAY));
+        }
+        return this;
+    }
+
+    @Override
+    public void onPress(final InputWithModifiers input) {
+        lastPressedAt = System.currentTimeMillis();
+    }
+
+    @Override
+    protected void extractContents(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        extractBackground(graphics, mouseX, mouseY, partialTicks);
+
+        renderTooltipIfHovered(graphics, mouseX, mouseY);
+    }
+
+    private void renderTooltipIfHovered(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY) {
+        final List<Component> lines = getTooltipLines();
+        if (lines.isEmpty()) {
+            return;
+        }
+
+        if (isHovered()) {
+            if (hoveringStartedAt == 0) {
+                hoveringStartedAt = System.currentTimeMillis();
+            }
+
+            if ((System.currentTimeMillis() - hoveringStartedAt) > TOOLTIP_DELAY) {
+                TooltipRenderer.drawTooltip(graphics, lines, mouseX, mouseY, 200);
+            }
+        } else {
+            hoveringStartedAt = 0;
+        }
+    }
+
+    @Override
+    protected void updateWidgetNarration(final NarrationElementOutput element) {
+        defaultButtonNarrationText(element);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected List<Component> getTooltipLines() {
+        return tooltip;
+    }
+
+    public void extractBackground(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        final boolean isPressed = (System.currentTimeMillis() - lastPressedAt) < PRESS_DURATION;
+        (isPressed ? pressedImage : baseImage).draw(graphics, getX(), getY(), width, height);
+
+        if (!Objects.equals(getMessage(), CommonComponents.EMPTY)) {
+            graphics.centeredText(Minecraft.getInstance().font, getMessage(),
+                getX() + width / 2, getY() + (height - 8) / 2,
+                (active ? 0xFFFFFF : 0xA0A0A0) | Mth.ceil(alpha * 255) << 24);
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @FunctionalInterface
+    private interface Background {
+        void draw(GuiGraphicsExtractor graphics, int x, int y, int width, int height);
+    }
+}

@@ -1,0 +1,179 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.client.gui;
+
+import com.mojang.blaze3d.platform.InputConstants;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
+import li.cil.oc2.client.ClientPlatform;
+import li.cil.oc2.common.blockentity.KeyboardBlockEntity;
+import li.cil.oc2.common.bus.device.block.KeyboardDevice;
+import li.cil.oc2.common.item.Items;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.message.KeyboardInputMessage;
+import li.cil.oc2.common.network.message.KeyboardKeepAliveMessage;
+import net.minecraft.client.MouseHandler;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.item.component.SwingAnimation;
+
+
+public final class KeyboardScreen extends AbstractBlockEntityScreen<KeyboardBlockEntity> {
+    private static final int BORDER_SIZE = 4;
+    private static final float ARM_SWING_RATE = 0.8f;
+    private static final int BORDER_COLOR = 0xFFFFFFFF;
+
+    private static final MutableComponent CLOSE_INFO = Component.translatable("gui.oc2.keyboard.close_info");
+
+    // --------------------------------------------------------------------- //
+
+    private final IntSet pressedKeys = new IntOpenHashSet();
+    private int keepAliveCountdown;
+
+    // --------------------------------------------------------------------- //
+
+    public KeyboardScreen(final KeyboardBlockEntity keyboard) {
+        super(Component.translatable(Items.KEYBOARD.get().getDescriptionId()), keyboard);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void init() {
+        super.init();
+
+        // Grabbing the mouse allows us to let the player keep turning the camera (to get a better
+        // look at the projection of a projector, e.g.), while still grabbing all keyboard input.
+        grabMouse();
+
+        // Disable hotbar since we don't need it here, and it just blocks screen space.
+        ClientPlatform.setHotbarVisible(false);
+    }
+
+    @Override
+    protected void safeTick() {
+        sendKeepAlive();
+    }
+
+    @Override
+    public boolean keyPressed(final KeyEvent event) {
+        final int keycode = event.key();
+        if (pressedKeys.add(keycode)) {
+            sendInputMessage(keycode, true);
+        }
+
+        return true;
+    }
+
+    @Override
+    public boolean keyReleased(final KeyEvent event) {
+        final int keycode = event.key();
+        if (pressedKeys.remove(keycode)) {
+            sendInputMessage(keycode, false);
+        }
+
+        return true;
+    }
+
+    @Override
+    public boolean mouseClicked(final MouseButtonEvent event, final boolean doubleClick) {
+        final int button = event.button();
+        if (button == InputConstants.MOUSE_BUTTON_RIGHT) {
+            onClose();
+            return true;
+        } else {
+            return super.mouseClicked(event, doubleClick);
+        }
+    }
+
+    @Override
+    public void extractBackground(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        // This page intentionally left blank.
+    }
+
+    @Override
+    protected void renderFg(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        renderBorderOverlay(graphics);
+
+        graphics.textWithWordWrap(font, CLOSE_INFO,
+            BORDER_SIZE * 3, height - BORDER_SIZE * 3 - font.lineHeight,
+            width - BORDER_SIZE * 6, 0x88FFFFFF);
+    }
+
+    @Override
+    public void removed() {
+        super.removed();
+
+        if (minecraft.getConnection() != null) {
+            for (final int keycode : pressedKeys) {
+                sendKeyState(keycode, false);
+            }
+        }
+        pressedKeys.clear();
+
+        ClientPlatform.setHotbarVisible(true);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void renderBorderOverlay(final GuiGraphicsExtractor graphics) {
+        graphics.fill(BORDER_SIZE, BORDER_SIZE, width - BORDER_SIZE, BORDER_SIZE * 2, BORDER_COLOR);
+        graphics.fill(BORDER_SIZE, BORDER_SIZE, BORDER_SIZE * 2, height - BORDER_SIZE, BORDER_COLOR);
+        graphics.fill(BORDER_SIZE, height - BORDER_SIZE * 2, width - BORDER_SIZE, height - BORDER_SIZE, BORDER_COLOR);
+        graphics.fill(width - BORDER_SIZE * 2, BORDER_SIZE, width - BORDER_SIZE, height - BORDER_SIZE, BORDER_COLOR);
+    }
+
+    private void grabMouse() {
+        final MouseHandler mouseHandler = minecraft.mouseHandler;
+        mouseHandler.mouseGrabbed = true;
+        InputConstants.grabMouse(minecraft.getWindow(), mouseHandler.xpos(), mouseHandler.ypos());
+    }
+
+    private void sendKeepAlive() {
+        if (--keepAliveCountdown <= 0) {
+            keepAliveCountdown = KeyboardDevice.USER_KEEPALIVE_EVERY;
+            Network.sendToServer(new KeyboardKeepAliveMessage(blockEntity));
+        }
+    }
+
+    private void sendInputMessage(final int keycode, final boolean isDown) {
+        if (KeyCodeMapping.MAPPING.containsKey(keycode)) {
+            swingArm();
+            sendKeyState(keycode, isDown);
+        }
+    }
+
+    private void sendKeyState(final int keycode, final boolean isDown) {
+        if (KeyCodeMapping.MAPPING.containsKey(keycode)) {
+            final int evdevCode = KeyCodeMapping.MAPPING.get(keycode);
+            Network.sendToServer(new KeyboardInputMessage(blockEntity, evdevCode, isDown));
+        }
+    }
+
+    private void swingArm() {
+        final LocalPlayer player = minecraft.player;
+        if (player == null) {
+            return;
+        }
+
+        final RandomSource random = player.getRandom();
+        if (random.nextFloat() < ARM_SWING_RATE) {
+            return;
+        }
+
+        final InteractionHand handToSwing;
+        if (minecraft.options.getCameraType().isFirstPerson()) {
+            handToSwing = InteractionHand.MAIN_HAND;
+        } else {
+            handToSwing = random.nextBoolean() ? InteractionHand.MAIN_HAND : InteractionHand.OFF_HAND;
+        }
+
+        player.swing(handToSwing, SwingAnimation.DEFAULT, false);
+    }
+}

@@ -1,0 +1,27 @@
+{
+  "variants": {
+    "facing=down": {
+      "model": "oc2:block/cable_support",
+      "x": 270
+    },
+    "facing=up": {
+      "model": "oc2:block/cable_support",
+      "x": 90
+    },
+    "facing=north": {
+      "model": "oc2:block/cable_support",
+      "y": 180
+    },
+    "facing=south": {
+      "model": "oc2:block/cable_support"
+    },
+    "facing=west": {
+      "model": "oc2:block/cable_support",
+      "y": 90
+    },
+    "facing=east": {
+      "model": "oc2:block/cable_support",
+      "y": 270
+    }
+  }
+}

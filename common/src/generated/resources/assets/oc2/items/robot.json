@@ -1,0 +1,9 @@
+{
+  "model": {
+    "type": "minecraft:special",
+    "base": "oc2:item/robot",
+    "model": {
+      "type": "oc2:robot"
+    }
+  }
+}

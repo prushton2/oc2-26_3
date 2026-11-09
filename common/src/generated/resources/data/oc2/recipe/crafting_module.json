@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": "oc2:circuit_board",
+    "C": "#c:ingots/copper",
+    "R": "minecraft:crafting_table",
+    "T": "oc2:transistor"
+  },
+  "pattern": [
+    "TRC",
+    " B "
+  ],
+  "result": {
+    "id": "oc2:crafting_module"
+  }
+}

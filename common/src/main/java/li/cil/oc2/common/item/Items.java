@@ -1,0 +1,117 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.item;
+
+import dev.architectury.registry.registries.DeferredRegister;
+import dev.architectury.registry.registries.RegistrySupplier;
+import li.cil.oc2.api.bus.device.vm.ArchitectureType;
+import li.cil.oc2.common.Config;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.block.Blocks;
+import li.cil.oc2.common.util.RegistryUtils;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.item.DyeColor;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+
+import java.util.List;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+public final class Items {
+    private static final DeferredRegister<Item> ITEMS = RegistryUtils.getInitializerFor(Registries.ITEM);
+
+    // --------------------------------------------------------------------- //
+
+    public static final RegistrySupplier<Item> BUS_CABLE = register(Blocks.BUS_CABLE, BusCableItem::new);
+    public static final RegistrySupplier<BusInterfaceItem> BUS_INTERFACE = register("bus_interface", BusInterfaceItem::new);
+    public static final RegistrySupplier<Item> CHARGER = register(Blocks.CHARGER, ChargerItem::new);
+    public static final RegistrySupplier<Item> COMPUTER = register(Blocks.COMPUTER, ComputerItem::new);
+    public static final RegistrySupplier<Item> CREATIVE_ENERGY = register(Blocks.CREATIVE_ENERGY);
+    public static final RegistrySupplier<Item> DISK_DRIVE = register(Blocks.DISK_DRIVE);
+    public static final RegistrySupplier<Item> FLASH_DRIVE = register(Blocks.FLASH_DRIVE);
+    public static final RegistrySupplier<Item> KEYBOARD = register(Blocks.KEYBOARD);
+    public static final RegistrySupplier<Item> NETWORK_CONNECTOR = register(Blocks.NETWORK_CONNECTOR);
+    public static final RegistrySupplier<Item> NETWORK_HUB = register(Blocks.NETWORK_HUB);
+    public static final RegistrySupplier<Item> INTERNET_GATEWAY = register(Blocks.INTERNET_GATEWAY);
+    public static final RegistrySupplier<Item> PROJECTOR = register(Blocks.PROJECTOR);
+    public static final RegistrySupplier<Item> REDSTONE_INTERFACE = register(Blocks.REDSTONE_INTERFACE);
+    public static final RegistrySupplier<Item> TERMINAL = register(Blocks.TERMINAL);
+    public static final RegistrySupplier<Item> TRANSPOSER = register(Blocks.TRANSPOSER);
+
+    // --------------------------------------------------------------------- //
+
+    public static final RegistrySupplier<Item> WRENCH = register("wrench", WrenchItem::new);
+    public static final RegistrySupplier<Item> MANUAL = register("manual", ManualItem::new);
+
+    public static final RegistrySupplier<Item> ROBOT = register("robot", RobotItem::new);
+    public static final RegistrySupplier<NetworkCableItem> NETWORK_CABLE = register("network_cable", NetworkCableItem::new);
+
+    public static final RegistrySupplier<CpuItem> CPU_RISCV = register("cpu_riscv", () ->
+        new CpuItem(ArchitectureType.RISCV));
+    public static final RegistrySupplier<CpuItem> CPU_Z80 = register("cpu_z80", () ->
+        new CpuItem(ArchitectureType.Z80));
+
+    public static final RegistrySupplier<MemoryItem> MEMORY_SMALL = register("memory_small", () ->
+        new MemoryItem(() -> Config.memorySmallSize));
+    public static final RegistrySupplier<MemoryItem> MEMORY_MEDIUM = register("memory_medium", () ->
+        new MemoryItem(() -> Config.memoryMediumSize));
+    public static final RegistrySupplier<MemoryItem> MEMORY_LARGE = register("memory_large", () ->
+        new MemoryItem(() -> Config.memoryLargeSize));
+
+    public static final RegistrySupplier<HardDriveItem> HARD_DRIVE_SMALL = register("hard_drive_small", () ->
+        new HardDriveItem(() -> Config.hardDriveSmallSize, DyeColor.LIGHT_GRAY));
+    public static final RegistrySupplier<HardDriveItem> HARD_DRIVE_MEDIUM = register("hard_drive_medium", () ->
+        new HardDriveItem(() -> Config.hardDriveMediumSize, DyeColor.GREEN));
+    public static final RegistrySupplier<HardDriveItem> HARD_DRIVE_LARGE = register("hard_drive_large", () ->
+        new HardDriveItem(() -> Config.hardDriveLargeSize, DyeColor.CYAN));
+
+    public static final List<RegistrySupplier<HardDriveItem>> HARD_DRIVES =
+        List.of(HARD_DRIVE_SMALL, HARD_DRIVE_MEDIUM, HARD_DRIVE_LARGE);
+
+    public static final RegistrySupplier<FlashMemoryItem> FLASH_MEMORY = register("flash_memory", () ->
+        new FlashMemoryItem(Constants.FLASH_MEMORY_SIZE));
+
+    public static final RegistrySupplier<FloppyItem> FLOPPY = register("floppy", () ->
+        new FloppyItem(() -> Config.floppySize));
+
+    public static final RegistrySupplier<Item> FILE_IMPORT_EXPORT_CARD = register("file_import_export_card");
+    public static final RegistrySupplier<Item> NETWORK_INTERFACE_CARD = register("network_interface_card", NetworkInterfaceCardItem::new);
+    public static final RegistrySupplier<Item> NETWORK_TUNNEL_CARD = register("network_tunnel_card", NetworkTunnelItem::new);
+    public static final RegistrySupplier<Item> REDSTONE_INTERFACE_CARD = register("redstone_interface_card");
+    public static final RegistrySupplier<Item> SERIAL_INTERFACE_CARD = register("serial_interface_card", SerialInterfaceCardItem::new);
+    public static final RegistrySupplier<Item> SOUND_CARD = register("sound_card");
+
+    public static final RegistrySupplier<Item> BLOCK_OPERATIONS_MODULE = register("block_operations_module", BlockOperationsModule::new);
+    public static final RegistrySupplier<Item> CRAFTING_MODULE = register("crafting_module");
+    public static final RegistrySupplier<Item> INVENTORY_OPERATIONS_MODULE = register("inventory_operations_module");
+    public static final RegistrySupplier<Item> NETWORK_TUNNEL_MODULE = register("network_tunnel_module", NetworkTunnelItem::new);
+    public static final RegistrySupplier<Item> SCANNER_MODULE = register("scanner_module");
+    public static final RegistrySupplier<Item> TANK_OPERATIONS_MODULE = register("tank_operations_module");
+
+    public static final RegistrySupplier<Item> CIRCUIT_BOARD = register("circuit_board", ModItem::new);
+    public static final RegistrySupplier<Item> TRANSISTOR = register("transistor", ModItem::new);
+
+    // --------------------------------------------------------------------- //
+
+    public static void initialize() {
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static RegistrySupplier<Item> register(final String name) {
+        return register(name, ModItem::new);
+    }
+
+    private static <T extends Item> RegistrySupplier<T> register(final String name, final Supplier<T> factory) {
+        return RegistryUtils.register(ITEMS, name, factory);
+    }
+
+    private static <T extends Block> RegistrySupplier<Item> register(final RegistrySupplier<T> block) {
+        return register(block, ModBlockItem::new);
+    }
+
+    private static <TBlock extends Block, TItem extends Item> RegistrySupplier<TItem> register(final RegistrySupplier<TBlock> block, final Function<TBlock, TItem> factory) {
+        return register(block.getId().getPath(), () -> factory.apply(block.get()));
+    }
+}

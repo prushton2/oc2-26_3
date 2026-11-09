@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": "oc2:circuit_board",
+    "C": "#c:ingots/copper",
+    "R": "minecraft:redstone_torch",
+    "X": "oc2:bus_interface"
+  },
+  "pattern": [
+    "CRX",
+    " B "
+  ],
+  "result": {
+    "id": "oc2:redstone_interface_card"
+  }
+}

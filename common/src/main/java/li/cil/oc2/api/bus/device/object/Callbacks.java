@@ -1,0 +1,269 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.api.bus.device.object;
+
+import li.cil.oc2.api.bus.device.rpc.*;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.logging.log4j.util.Strings;
+
+import javax.annotation.Nullable;
+import java.lang.invoke.MethodHandle;
+import java.lang.invoke.MethodHandles;
+import java.lang.reflect.Method;
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static java.util.Objects.requireNonNull;
+
+/**
+ * Provides automated extraction of {@link RPCMethod}s from instances of
+ * classes with methods annotated with the {@link Callback} annotation.
+ * <p>
+ * Prefer using {@link ObjectDevice} instead of using this class directly.
+ *
+ * @see RPCMethod
+ * @see Callback
+ * @see IOCallbacks
+ */
+public final class Callbacks {
+    private static final Logger LOGGER = LogManager.getLogger(Callbacks.class);
+
+    static final String ERROR_NOT_ENOUGH_ENERGY = "not enough energy";
+
+    // --------------------------------------------------------------------- //
+
+    private static final Map<Class<?>, List<Method>> METHOD_BY_TYPE = Collections.synchronizedMap(new HashMap<>());
+    private static final Map<Method, RPCParameter[]> PARAMETERS_BY_METHOD = Collections.synchronizedMap(new HashMap<>());
+
+    // --------------------------------------------------------------------- //
+
+    /**
+     * Collects all methods annotated with {@link Callback} in the specified object
+     * and generated {@link RPCMethod}s for each one.
+     * <p>
+     * The generated {@link RPCMethod} will be bound to the passed object and
+     * can be called without needing to pass the object.
+     * <p>
+     * For example:
+     * <pre>
+     * class Example {
+     *   &#64;Callback
+     *   public void f(String a) { }
+     * }
+     *
+     * List&lt;RPCMethod&gt; methods = Callbacks.collectMethods(new Example());
+     * methods.get(0).invoke("argument");
+     * </pre>
+     *
+     * @param methodContainer an instance of a class with annotated methods.
+     * @return the list of methods extracted from the specified object.
+     * @throws IllegalArgumentException if an annotated method has an invalid energy cost.
+     */
+    public static List<RPCMethodGroup> collectMethods(final Object methodContainer) {
+        final List<Method> reflectedMethods = getMethods(methodContainer.getClass());
+
+        final ArrayList<RPCMethodGroup> methods = new ArrayList<>(reflectedMethods.size());
+        for (final Method method : reflectedMethods) {
+            try {
+                methods.add(new ObjectRPCMethod(methodContainer, method));
+            } catch (final IllegalAccessException e) {
+                LOGGER.error("Failed accessing method [{}].", method);
+            }
+        }
+
+        return methods;
+    }
+
+    /**
+     * Returns whether any {@link Callback} annotated methods are present on the specified
+     * object without creating bound {@link RPCMethod} instances.
+     * <p>
+     * The specified {@code object} can be an instance or a {@link Class}.
+     *
+     * @param object the object to check for methods on.
+     * @return {@code true} if any methods were found on the object; {@code false} otherwise.
+     */
+    public static boolean hasMethods(final Object object) {
+        if (object instanceof final Class<?> clazz) {
+            return !getMethods(clazz).isEmpty();
+        } else {
+            return !getMethods(object.getClass()).isEmpty();
+        }
+    }
+
+    /**
+     * Returns the type name declared by the specified object's {@link RPCDeviceDescription}.
+     * <p>
+     * Without a declaration, the name is derived from the class name: {@code ExampleDevice}
+     * becomes {@code example}.
+     * <p>
+     * The specified {@code object} can be an instance or a {@link Class}.
+     *
+     * @param object the object to read the type name from.
+     * @return the type name.
+     */
+    public static String getTypeName(final Object object) {
+        final Class<?> type = object instanceof final Class<?> clazz ? clazz : object.getClass();
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            final RPCDeviceDescription annotation = current.getAnnotation(RPCDeviceDescription.class);
+            if (annotation != null && !annotation.typeName().isEmpty()) {
+                return annotation.typeName();
+            }
+        }
+        return toNiceTypeName(type);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    static void validateEnergy(final Method method, final int energy, final boolean synchronize) {
+        if (energy < 0) {
+            throw new IllegalArgumentException("Energy cost [" + energy + "] on [" + method + "] is negative.");
+        }
+        if (energy > 0 && !synchronize) {
+            throw new IllegalArgumentException("Energy cost on [" + method + "] requires the method to be synchronized.");
+        }
+    }
+
+    private static String toNiceTypeName(final Class<?> deviceClass) {
+        final String name = deviceClass.getSimpleName()
+            .replaceFirst("VMDevice$", "")
+            .replaceFirst("RPCDevice$", "")
+            .replaceFirst("Device$", "");
+        return name
+            .replaceAll("([a-z])([A-Z])", "$1_$2")
+            .toLowerCase(Locale.ROOT);
+    }
+
+    private static List<Method> getMethods(final Class<?> type) {
+        synchronized (METHOD_BY_TYPE) {
+            return METHOD_BY_TYPE.computeIfAbsent(type, c -> Arrays.stream(c.getMethods())
+                .filter(m -> m.isAnnotationPresent(Callback.class))
+                .collect(Collectors.toList()));
+        }
+    }
+
+    private static final class ObjectRPCMethod extends AbstractRPCMethod {
+        private final MethodHandle handle;
+        private final int energy;
+        private final String description;
+        private final String returnValueDescription;
+
+        public ObjectRPCMethod(final Object target, final Method method) throws IllegalAccessException {
+            this(new ConstructorData(target, method));
+        }
+
+        private ObjectRPCMethod(final ConstructorData data) throws IllegalAccessException {
+            super(data.methodName, data.annotation.synchronize(), data.method.getReturnType(), data.parameters);
+
+            this.handle = MethodHandles.lookup().unreflect(data.method).bindTo(data.target);
+            this.energy = data.annotation.energy();
+            this.description = data.description;
+            this.returnValueDescription = data.returnValueDescription;
+        }
+
+        @Nullable
+        @Override
+        public Object invoke(final RPCInvocation invocation) throws Throwable {
+            if (energy > 0 && !invocation.consumeEnergy(energy)) {
+                throw new IllegalStateException(ERROR_NOT_ENOUGH_ENERGY);
+            }
+            return super.invoke(invocation);
+        }
+
+        @Nullable
+        @Override
+        protected Object invoke(final Object... parameters) throws Throwable {
+            return handle.invokeWithArguments(parameters);
+        }
+
+        @Override
+        public Optional<String> getDescription() {
+            return Optional.ofNullable(description);
+        }
+
+        @Override
+        public Optional<String> getReturnValueDescription() {
+            return Optional.ofNullable(returnValueDescription);
+        }
+
+        @Override
+        public boolean equals(final Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            final ObjectRPCMethod that = (ObjectRPCMethod) o;
+            return handle.equals(that.handle);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(handle);
+        }
+
+        @Override
+        public String toString() {
+            return handle.toString();
+        }
+
+        // Utility class to precompute stuff for constructor before calling super constructor.
+        private static final class ConstructorData {
+            public final Object target;
+            public final Method method;
+            public final Callback annotation;
+            public final String methodName;
+            @Nullable
+            public final String description;
+            @Nullable
+            public final String returnValueDescription;
+            public final RPCParameter[] parameters;
+
+            public ConstructorData(final Object target, final Method method) {
+                this.target = target;
+                this.method = method;
+                this.annotation = requireNonNull(method.getAnnotation(Callback.class), "Method without Callback annotation.");
+                validateEnergy(method, annotation.energy(), annotation.synchronize());
+                this.methodName = Strings.isNotBlank(annotation.name()) ? annotation.name() : method.getName();
+                this.description = Strings.isNotBlank(annotation.description()) ? annotation.description() : null;
+                this.returnValueDescription = Strings.isNotBlank(annotation.returnValueDescription()) ? annotation.returnValueDescription() : null;
+                this.parameters = PARAMETERS_BY_METHOD.computeIfAbsent(method,
+                    m -> Arrays.stream(m.getParameters())
+                        .map(ReflectionParameter::new)
+                        .toArray(RPCParameter[]::new));
+            }
+        }
+
+        private static final class ReflectionParameter implements RPCParameter {
+            private final Class<?> type;
+            @Nullable
+            private final String name;
+            @Nullable
+            private final String description;
+
+            public ReflectionParameter(final java.lang.reflect.Parameter parameter) {
+                this.type = parameter.getType();
+
+                final Parameter annotation = parameter.getAnnotation(Parameter.class);
+                final boolean hasName = annotation != null && Strings.isNotBlank(annotation.value());
+                final boolean hasDescription = annotation != null && Strings.isNotBlank(annotation.description());
+
+                this.name = hasName ? annotation.value() : parameter.isNamePresent() ? parameter.getName() : null;
+                this.description = hasDescription ? annotation.description() : null;
+            }
+
+            @Override
+            public Class<?> getType() {
+                return type;
+            }
+
+            @Override
+            public Optional<String> getName() {
+                return Optional.ofNullable(name);
+            }
+
+            @Override
+            public Optional<String> getDescription() {
+                return Optional.ofNullable(description);
+            }
+        }
+    }
+}

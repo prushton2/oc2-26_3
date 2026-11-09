@@ -1,0 +1,260 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import li.cil.oc2.api.bus.device.io.IOInputStream;
+import li.cil.oc2.api.bus.device.io.IOMethod;
+import li.cil.oc2.api.bus.device.io.IOOutputStream;
+import li.cil.oc2.api.bus.device.object.IOCallback;
+import li.cil.oc2.api.bus.device.object.IOCallbacks;
+import li.cil.oc2.api.bus.device.object.IODeviceDescription;
+import li.cil.oc2.common.bus.device.RedstoneInterfaceDevice;
+import org.junit.jupiter.api.Test;
+
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+import static li.cil.oc2.common.bus.TestIOInvocation.invoke;
+import static li.cil.oc2.common.bus.TestIOInvocation.method;
+import static org.junit.jupiter.api.Assertions.*;
+
+public final class IOCallbacksTests {
+    @Test
+    public void collectsAnnotatedMethods() {
+        final List<IOMethod> functions = IOCallbacks.collectMethods(new AllSignatures());
+        assertEquals(4, functions.size());
+        assertEquals(List.of(1, 2, 3, 4), functions.stream().map(IOMethod::getCode).sorted().toList());
+    }
+
+    @Test
+    public void collectsNothingFromPlainObject() {
+        assertTrue(IOCallbacks.collectMethods(new Object()).isEmpty());
+        assertFalse(IOCallbacks.hasMethods(new Object()));
+        assertTrue(IOCallbacks.hasMethods(new AllSignatures()));
+    }
+
+    @Test
+    public void synchronizeDefaultsToTrue() {
+        final AllSignatures target = new AllSignatures();
+        assertTrue(method(target, 1).isSynchronized());
+        assertFalse(method(target, 4).isSynchronized());
+    }
+
+    @Test
+    public void invokesAllFourSignatures() throws Throwable {
+        final AllSignatures target = new AllSignatures();
+
+        invoke(method(target, 1), new byte[0]);
+        assertTrue(target.calledWithoutStreams);
+
+        invoke(method(target, 2), new byte[]{42});
+        assertEquals(42, target.readArgument);
+
+        assertArrayEquals(new byte[]{7}, invoke(method(target, 3), new byte[0]));
+
+        assertArrayEquals(new byte[]{23}, invoke(method(target, 4), new byte[]{23}));
+    }
+
+    @Test
+    public void richStreamSignaturesAreAccepted() throws Throwable {
+        final RichSignatures target = new RichSignatures();
+        assertEquals(3, IOCallbacks.collectMethods(target).size());
+
+        invoke(method(target, 1), new byte[]{0x34, 0x12});
+        assertEquals(0x1234, target.readArgument, "arguments should read low byte first");
+
+        assertArrayEquals(new byte[]{0x78, 0x56}, invoke(method(target, 2), new byte[0]),
+            "results should write low byte first");
+        assertArrayEquals("hi".getBytes(StandardCharsets.US_ASCII),
+            invoke(method(target, 3), "hi".getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    @Test
+    public void duplicateFunctionCodesThrow() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new DuplicateCodes()));
+    }
+
+    @Test
+    public void functionCodeOutsideRangeThrows() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new ReservedCode()));
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new NegativeCode()));
+    }
+
+    @Test
+    public void unsupportedSignatureThrows() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new WrongParameters()));
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new NonVoidReturn()));
+    }
+
+    @Test
+    public void energyIsConsumedBeforeInvocation() throws Throwable {
+        final Priced target = new Priced();
+        final TestIOInvocation invocation = new TestIOInvocation(new byte[0], 5);
+        method(target, 1).invoke(invocation);
+        assertEquals(1, target.calls);
+        assertEquals(2, invocation.energy);
+    }
+
+    @Test
+    public void insufficientEnergySkipsInvocation() {
+        final Priced target = new Priced();
+        final TestIOInvocation invocation = new TestIOInvocation(new byte[0], 2);
+        assertThrows(IllegalStateException.class, () -> method(target, 1).invoke(invocation));
+        assertEquals(0, target.calls);
+        assertEquals(2, invocation.energy);
+    }
+
+    @Test
+    public void invalidEnergyCostThrows() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new NegativeEnergy()));
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.collectMethods(new UnsynchronizedEnergy()));
+    }
+
+    @Test
+    public void missingNameThrows() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.getName(new Unnamed()));
+    }
+
+    @Test
+    public void nameIsReadFromAnnotation() {
+        assertEquals("TEST", IOCallbacks.getName(new AllSignatures()));
+    }
+
+    @Test
+    public void overlongNameThrows() {
+        assertThrows(IllegalArgumentException.class, () -> IOCallbacks.getName(new OverlongName()));
+    }
+
+    @Test
+    public void redstoneDeviceExposesItsFunctions() {
+        assertTrue(IOCallbacks.hasMethods(RedstoneInterfaceDevice.class));
+        assertEquals("REDSTN", IOCallbacks.getName(RedstoneInterfaceDevice.class));
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @IODeviceDescription(name = "TEST")
+    public static final class AllSignatures {
+        public boolean calledWithoutStreams;
+        public int readArgument = -1;
+
+        @IOCallback(1)
+        public void noStreams() {
+            calledWithoutStreams = true;
+        }
+
+        @IOCallback(2)
+        public void argumentsOnly(final InputStream arguments) throws Exception {
+            readArgument = arguments.read();
+        }
+
+        @IOCallback(3)
+        public void resultsOnly(final OutputStream results) throws Exception {
+            results.write(7);
+        }
+
+        @IOCallback(value = 4, synchronize = false)
+        public void bothStreams(final InputStream arguments, final OutputStream results) throws Exception {
+            results.write(arguments.read());
+        }
+    }
+
+    @IODeviceDescription(name = "RICH")
+    public static final class RichSignatures {
+        public int readArgument = -1;
+
+        @IOCallback(1)
+        public void argumentsOnly(final IOInputStream arguments) throws Exception {
+            readArgument = arguments.readU16();
+        }
+
+        @IOCallback(2)
+        public void resultsOnly(final IOOutputStream results) throws Exception {
+            results.writeU16(0x5678);
+        }
+
+        @IOCallback(3)
+        public void bothStreams(final IOInputStream arguments, final IOOutputStream results) throws Exception {
+            results.writeString(arguments.readString());
+        }
+    }
+
+    @IODeviceDescription(name = "COST")
+    public static final class Priced {
+        public int calls;
+
+        @IOCallback(value = 1, energy = 3)
+        public void priced() {
+            calls++;
+        }
+    }
+
+    @IODeviceDescription(name = "NEG")
+    public static final class NegativeEnergy {
+        @IOCallback(value = 1, energy = -1)
+        public void priced() {
+        }
+    }
+
+    @IODeviceDescription(name = "ASYNC")
+    public static final class UnsynchronizedEnergy {
+        @IOCallback(value = 1, synchronize = false, energy = 1)
+        public void priced() {
+        }
+    }
+
+    @IODeviceDescription(name = "DUP")
+    public static final class DuplicateCodes {
+        @IOCallback(1)
+        public void first() {
+        }
+
+        @IOCallback(1)
+        public void second() {
+        }
+    }
+
+    @IODeviceDescription(name = "RSVD")
+    public static final class ReservedCode {
+        @IOCallback(IOCallback.RESERVED_CODE)
+        public void reserved() {
+        }
+    }
+
+    @IODeviceDescription(name = "NEG")
+    public static final class NegativeCode {
+        @IOCallback(-1)
+        public void negative() {
+        }
+    }
+
+    @IODeviceDescription(name = "PARAM")
+    public static final class WrongParameters {
+        @IOCallback(1)
+        public void wrong(final String unsupported) {
+        }
+    }
+
+    @IODeviceDescription(name = "RET")
+    public static final class NonVoidReturn {
+        @IOCallback(1)
+        public int wrong() {
+            return 0;
+        }
+    }
+
+    public static final class Unnamed {
+        @IOCallback(1)
+        public void unnamed() {
+        }
+    }
+
+    @IODeviceDescription(name = "TOOLONGNAME")
+    public static final class OverlongName {
+        @IOCallback(1)
+        public void overlong() {
+        }
+    }
+}

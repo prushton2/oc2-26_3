@@ -1,0 +1,104 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.item.crafting;
+
+import com.mojang.serialization.MapCodec;
+import li.cil.oc2.common.integration.Wrenches;
+import li.cil.oc2.common.util.StorageItemUtils;
+import li.cil.oc2.common.util.StorageItemUtils.State;
+import net.minecraft.core.NonNullList;
+import net.minecraft.network.RegistryFriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ItemStackTemplate;
+import net.minecraft.world.item.crafting.CraftingInput;
+import net.minecraft.world.item.crafting.CustomRecipe;
+import net.minecraft.world.item.crafting.RecipeSerializer;
+import net.minecraft.world.level.Level;
+
+public final class ResetRecipe extends CustomRecipe {
+    public static final ResetRecipe INSTANCE = new ResetRecipe();
+    public static final MapCodec<ResetRecipe> MAP_CODEC = MapCodec.unit(INSTANCE);
+    public static final StreamCodec<RegistryFriendlyByteBuf, ResetRecipe> STREAM_CODEC = StreamCodec.unit(INSTANCE);
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public boolean matches(final CraftingInput input, final Level level) {
+        int damagedCount = 0, wrenchCount = 0;
+
+        for (int slot = 0; slot < input.size(); slot++) {
+            final ItemStack stack = input.getItem(slot);
+            if (stack.isEmpty()) {
+                continue;
+            }
+
+            if (StorageItemUtils.needsRepair(stack)) {
+                damagedCount++;
+            } else if (Wrenches.isWrench(stack)) {
+                wrenchCount++;
+            } else {
+                return false;
+            }
+        }
+
+        return damagedCount == 1 && wrenchCount == 1;
+    }
+
+    @Override
+    public ItemStack assemble(final CraftingInput input) {
+        final ItemStack stack = findDamagedDataItem(input);
+        if (stack.isEmpty()) {
+            return ItemStack.EMPTY;
+        }
+
+        final ItemStack result = stack.copy();
+        result.setCount(1);
+
+        if (StorageItemUtils.getState(stack) == State.INCONSISTENT) {
+            StorageItemUtils.setState(result, State.ACKNOWLEDGED);
+        } else {
+            StorageItemUtils.stripBlobData(result);
+        }
+
+        return result;
+    }
+
+    @Override
+    public NonNullList<ItemStack> getRemainingItems(final CraftingInput input) {
+        final NonNullList<ItemStack> result = NonNullList.withSize(input.size(), ItemStack.EMPTY);
+
+        for (int slot = 0; slot < input.size(); slot++) {
+            final ItemStack stack = input.getItem(slot);
+            if (StorageItemUtils.getState(stack) == State.CORRUPTED) {
+                StorageItemUtils.clearBlobData(stack);
+            } else if (stack.getItem().getCraftingRemainder() instanceof final ItemStackTemplate remainder) {
+                result.set(slot, remainder.create());
+            } else if (Wrenches.isWrench(stack)) {
+                final ItemStack copy = stack.copy();
+                copy.setCount(1);
+                result.set(slot, copy);
+            }
+        }
+
+        return result;
+    }
+
+    @Override
+    public RecipeSerializer<ResetRecipe> getSerializer() {
+        return RecipeSerializers.RESET.get();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static ItemStack findDamagedDataItem(final CraftingInput input) {
+        for (int slot = 0; slot < input.size(); slot++) {
+            final ItemStack stack = input.getItem(slot);
+            if (!stack.isEmpty() && StorageItemUtils.needsRepair(stack)) {
+                return stack;
+            }
+        }
+
+        return ItemStack.EMPTY;
+    }
+}

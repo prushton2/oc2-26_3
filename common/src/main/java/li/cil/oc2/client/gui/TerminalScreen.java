@@ -1,0 +1,165 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.client.gui;
+
+import li.cil.oc2.client.gui.widget.ImageButton;
+import li.cil.oc2.client.gui.widget.ToggleImageButton;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.blockentity.TerminalBlockEntity;
+import li.cil.oc2.common.item.Items;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.message.TerminalInputMessage;
+import li.cil.oc2.common.network.message.TerminalKeepAliveMessage;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.minecraft.client.input.CharacterEvent;
+import net.minecraft.client.input.InputWithModifiers;
+import net.minecraft.client.input.KeyEvent;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.network.chat.Component;
+
+import java.nio.ByteBuffer;
+
+public final class TerminalScreen extends AbstractBlockEntityScreen<TerminalBlockEntity> {
+    private final TerminalWidget terminalWidget;
+
+    private int keepAliveCountdown;
+
+    // --------------------------------------------------------------------- //
+
+    public TerminalScreen(final TerminalBlockEntity terminal) {
+        super(Component.translatable(Items.TERMINAL.get().getDescriptionId()), terminal);
+        this.terminalWidget = new TerminalWidget(new TerminalWidget.Parent() {
+            @Override
+            public int getWidth() {
+                return width;
+            }
+
+            @Override
+            public int getHeight() {
+                return height;
+            }
+
+            @Override
+            public boolean shouldRenderTerminal() {
+                return true;
+            }
+
+            @Override
+            public void sendTerminalInputToServer(ByteBuffer input) {
+                Network.sendToServer(new TerminalInputMessage(blockEntity, input));
+            }
+        }, terminal.getTerminal());
+        imageWidth = Sprites.TERMINAL_SCREEN.width;
+        imageHeight = Sprites.TERMINAL_SCREEN.height;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void safeTick() {
+        super.safeTick();
+
+        sendKeepAlive();
+
+        terminalWidget.tick();
+    }
+
+    @Override
+    public boolean mouseClicked(final MouseButtonEvent event, final boolean doubleClick) {
+        return terminalWidget.mouseClicked(event) ||
+            super.mouseClicked(event, doubleClick);
+    }
+
+    @Override
+    public boolean mouseReleased(final MouseButtonEvent event) {
+        return terminalWidget.mouseReleased(event) ||
+            super.mouseReleased(event);
+    }
+
+    @Override
+    public boolean mouseScrolled(final double mouseX, final double mouseY, final double deltaX, final double deltaY) {
+        return terminalWidget.mouseScrolled(mouseX, mouseY, deltaY) ||
+            super.mouseScrolled(mouseX, mouseY, deltaX, deltaY);
+    }
+
+    @Override
+    public boolean charTyped(final CharacterEvent event) {
+        return terminalWidget.charTyped(event) ||
+            super.charTyped(event);
+    }
+
+    @Override
+    public boolean keyPressed(final KeyEvent event) {
+        return terminalWidget.keyPressed(event) ||
+            super.keyPressed(event);
+    }
+
+    @Override
+    protected void init() {
+        super.init();
+        terminalWidget.init();
+
+        addRenderableWidget(new ToggleImageButton(
+            leftPos - Sprites.SIDEBAR_2.width + 4, topPos + CONTROLS_TOP + 4,
+            12, 12,
+            Sprites.INPUT_BUTTON_BASE,
+            Sprites.INPUT_BUTTON_PRESSED,
+            Sprites.INPUT_BUTTON_ACTIVE
+        ) {
+            @Override
+            public void onPress(final InputWithModifiers input) {
+                super.onPress(input);
+                InputCapture.toggle();
+            }
+
+            @Override
+            public boolean isToggled() {
+                return InputCapture.isEnabled();
+            }
+        }).withTooltip(
+            Component.translatable(Constants.TERMINAL_CAPTURE_INPUT_CAPTION),
+            Component.translatable(Constants.TERMINAL_CAPTURE_INPUT_DESCRIPTION)
+        );
+
+        addRenderableWidget(new ImageButton(
+            leftPos - Sprites.SIDEBAR_2.width + 4, topPos + CONTROLS_TOP + 4 + 14,
+            12, 12,
+            Sprites.CONFIG_BUTTON_INACTIVE,
+            Sprites.CONFIG_BUTTON_ACTIVE
+        ) {
+            @Override
+            public void onPress(final InputWithModifiers input) {
+                minecraft.gui.setScreen(new TerminalConfigurationScreen(blockEntity));
+            }
+        }).withTooltip(Component.translatable(Constants.OPEN_CONFIGURATION_CAPTION));
+    }
+
+    @Override
+    public void removed() {
+        super.removed();
+        terminalWidget.onClose();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public void renderFg(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        terminalWidget.render(graphics, mouseX, mouseY, null);
+    }
+
+    @Override
+    public void renderBg(final GuiGraphicsExtractor graphics, final int mouseX, final int mouseY, final float partialTicks) {
+        Sprites.SIDEBAR_2.draw(graphics, leftPos - Sprites.SIDEBAR_2.width, topPos + CONTROLS_TOP);
+
+        terminalWidget.extractBackground(graphics, mouseX, mouseY);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void sendKeepAlive() {
+        if (--keepAliveCountdown <= 0) {
+            keepAliveCountdown = TerminalBlockEntity.CLIENT_KEEPALIVE_EVERY;
+            Network.sendToServer(new TerminalKeepAliveMessage(blockEntity));
+        }
+    }
+}

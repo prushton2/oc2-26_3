@@ -1,0 +1,1541 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.entity;
+
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.DeviceContext;
+import li.cil.oc2.api.bus.device.DeviceTypes;
+import li.cil.oc2.api.bus.device.io.IOBusContext;
+import li.cil.oc2.api.bus.device.io.IOInputStream;
+import li.cil.oc2.api.bus.device.io.IOOutputStream;
+import li.cil.oc2.api.bus.device.object.*;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.api.bus.device.rpc.RPCBusContext;
+import li.cil.oc2.api.capabilities.TerminalUserProvider;
+import li.cil.oc2.api.util.RobotOperationSide;
+import li.cil.oc2.client.audio.TerminalBell;
+import li.cil.oc2.common.Config;
+import li.cil.oc2.common.bus.AbstractDeviceBusElement;
+import li.cil.oc2.common.bus.CommonDeviceBusController;
+import li.cil.oc2.common.bus.device.util.Devices;
+import li.cil.oc2.common.bus.device.util.FluidHandlerProtocol;
+import li.cil.oc2.common.bus.device.util.ItemHandlerProtocol;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.capabilities.CapabilityProvider;
+import li.cil.oc2.common.capabilities.CapabilityType;
+import li.cil.oc2.common.container.FixedSizeItemStackHandler;
+import li.cil.oc2.common.container.ItemStackHandler;
+import li.cil.oc2.common.container.RobotInventoryContainer;
+import li.cil.oc2.common.container.RobotTerminalContainer;
+import li.cil.oc2.common.energy.FixedEnergyHandler;
+import li.cil.oc2.common.entity.robot.*;
+import li.cil.oc2.common.fluid.FluidHandler;
+import li.cil.oc2.common.fluid.FluidStack;
+import li.cil.oc2.common.fluid.FluidTank;
+import li.cil.oc2.common.integration.Wrenches;
+import li.cil.oc2.common.item.Items;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.message.*;
+import li.cil.oc2.common.serialization.NBTSerialization;
+import li.cil.oc2.common.util.*;
+import li.cil.oc2.common.vm.*;
+import li.cil.oc2.common.vm.arch.AbstractArchitecture;
+import li.cil.oc2.common.vm.device.Terminal;
+import net.fabricmc.api.EnvType;
+import net.fabricmc.api.Environment;
+import net.minecraft.core.*;
+import net.minecraft.core.UUIDUtil;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.syncher.EntityDataAccessor;
+import net.minecraft.network.syncher.EntityDataSerializers;
+import net.minecraft.network.syncher.SynchedEntityData;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EntityType;
+import net.minecraft.world.entity.InterpolationHandler;
+import net.minecraft.world.entity.MoverType;
+import net.minecraft.world.entity.PositionPath;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.vehicle.boat.AbstractBoat;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.SoundType;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.entity.EntityInLevelCallback;
+import net.minecraft.world.level.storage.ValueInput;
+import net.minecraft.world.level.storage.ValueOutput;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.BooleanOp;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.time.Duration;
+import java.util.*;
+import java.util.function.IntPredicate;
+
+import static java.util.Collections.singleton;
+import static li.cil.oc2.common.Constants.ENERGY_TAG_NAME;
+import static li.cil.oc2.common.Constants.ITEMS_TAG_NAME;
+
+public final class Robot extends Entity implements li.cil.oc2.api.capabilities.Robot, TerminalUserProvider {
+    public static final EntityDataAccessor<BlockPos> TARGET_POSITION = SynchedEntityData.defineId(Robot.class, EntityDataSerializers.BLOCK_POS);
+    public static final EntityDataAccessor<Direction> TARGET_DIRECTION = SynchedEntityData.defineId(Robot.class, EntityDataSerializers.DIRECTION);
+    public static final EntityDataAccessor<Byte> SELECTED_SLOT = SynchedEntityData.defineId(Robot.class, EntityDataSerializers.BYTE);
+    public static final EntityDataAccessor<Integer> STATUS_COLOR = SynchedEntityData.defineId(Robot.class, EntityDataSerializers.INT);
+    public static final EntityDataAccessor<Float> STATUS_VALUE = SynchedEntityData.defineId(Robot.class, EntityDataSerializers.FLOAT);
+
+    public static final int DEFAULT_STATUS_COLOR = 0xEEEEFF;
+    public static final float DEFAULT_STATUS_VALUE = 1;
+
+    private static final String TERMINAL_TAG_NAME = "terminal";
+    private static final String STATE_TAG_NAME = "state";
+    private static final String BUS_ELEMENT_TAG_NAME = "bus_element";
+    private static final String DEVICES_TAG_NAME = "devices";
+    private static final String COMMAND_PROCESSOR_TAG_NAME = "commands";
+    private static final String INVENTORY_TAG_NAME = "inventory";
+    private static final String TANK_TAG_NAME = "tank";
+    private static final String SELECTED_SLOT_TAG_NAME = "selected_slot";
+    private static final String STATUS_COLOR_TAG_NAME = "status_color";
+    private static final String STATUS_VALUE_TAG_NAME = "status_value";
+    private static final String ORIGIN_TAG_NAME = "origin";
+
+    private static final int MAX_QUEUED_ACTIONS = 16;
+    private static final int MAX_QUEUED_RESULTS = 16;
+
+    private static final int CPU_SLOTS = 1;
+    private static final int MEMORY_SLOTS = 4;
+    private static final int HARD_DRIVE_SLOTS = 1;
+    private static final int FLOPPY_SLOTS = 1;
+    private static final int FLASH_MEMORY_SLOTS = 1;
+    private static final int MODULE_SLOTS = 4;
+    private static final int INVENTORY_SIZE = 12;
+    private static final int TANK_CAPACITY = 12 * FluidHandler.BUCKET;
+
+    private static final int CONTAINING_BLOCK_CHECK_INTERVAL = TickUtils.toTicks(Duration.ofSeconds(1));
+    private static final double MOVING_POSITION_SYNC_THRESHOLD = 1;
+    private static final float TURNING_ROTATION_SYNC_THRESHOLD = 45;
+
+    // --------------------------------------------------------------------- //
+
+    private final Runnable unloadListener = this::handleUnload;
+    private final BlockPos.MutableBlockPos mutablePosition = new BlockPos.MutableBlockPos();
+
+    @Nullable
+    private AABB lastContainingBlockSweepBounds;
+    private int containingBlockSweepCountdown;
+
+    private final AnimationState animationState = new AnimationState();
+    private final RobotActionProcessor actionProcessor = new RobotActionProcessor();
+    private final Terminal terminal = new Terminal();
+    private final RobotDevice robotDevice = new RobotDevice();
+    private final RobotBusElement busElement = new RobotBusElement();
+    private final RobotItemStackHandlers deviceItems = new RobotItemStackHandlers();
+    private final FixedEnergyHandler energy = new FixedEnergyHandler(Config.robotEnergyStorage);
+    private final RobotVirtualMachine virtualMachine = new RobotVirtualMachine(new CommonDeviceBusController(busElement, this::cpuEnergyPerTick, deviceItems::getArchitectureType));
+    private final ItemStackHandler inventory = new FixedSizeItemStackHandler(INVENTORY_SIZE);
+    private final FluidTank tank = new FluidTank(TANK_CAPACITY);
+    private final Set<Player> terminalUsers = Collections.newSetFromMap(new WeakHashMap<>());
+    private final List<CapabilityProvider> capabilityProviders = new ArrayList<>();
+    private volatile List<ServerPlayer> terminalRecipients = List.of(); // Copy for threaded send.
+    private long lastPistonMovement;
+    private List<Entity> ignoredColliders = List.of();
+    @Nullable
+    private GlobalPos origin;
+
+    // --------------------------------------------------------------------- //
+
+    public Robot(final EntityType<?> type, final Level world) {
+        super(type, world);
+        this.blocksBuilding = true;
+        setNoGravity(true);
+
+        if (world.isClientSide()) {
+            terminal.setDisplayOnly(true);
+        }
+
+        virtualMachine.setGameTimeSource(LevelUtils.gameTimeSupplier(world));
+        virtualMachine.getBusController().onAfterDeviceScan.add(this::handleAfterDeviceScan);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Environment(EnvType.CLIENT)
+    public AnimationState getAnimationState() {
+        return animationState;
+    }
+
+    public Terminal getTerminal() {
+        return terminal;
+    }
+
+    public VirtualMachine getVirtualMachine() {
+        return virtualMachine;
+    }
+
+    public VirtualMachineClientState getVirtualMachineClientState() {
+        return virtualMachine;
+    }
+
+    public VMItemStackHandlers getItemStackHandlers() {
+        return deviceItems;
+    }
+
+    public ItemStackHandler getInventory() {
+        return inventory;
+    }
+
+    public FluidTank getTank() {
+        return tank;
+    }
+
+    @Override
+    public int getSelectedSlot() {
+        return getEntityData().get(SELECTED_SLOT);
+    }
+
+    @Override
+    public void setSelectedSlot(final int value) {
+        getEntityData().set(SELECTED_SLOT, (byte) Mth.clamp(value, 0, INVENTORY_SIZE - 1));
+    }
+
+    public int getStatusColor() {
+        return getEntityData().get(STATUS_COLOR);
+    }
+
+    public void setStatusColor(final int value) {
+        getEntityData().set(STATUS_COLOR, value & 0xFFFFFF);
+    }
+
+    public float getStatusValue() {
+        return getEntityData().get(STATUS_VALUE);
+    }
+
+    public void setStatusValue(final float value) {
+        getEntityData().set(STATUS_VALUE, Float.isNaN(value) ? 0 : Mth.clamp(value, 0, 1));
+    }
+
+    @Nullable
+    @SuppressWarnings("unchecked")
+    public <T> T getCapability(final CapabilityType<T> capability, @Nullable final Direction side) {
+        if (capability == Capabilities.ITEM_HANDLER) {
+            return (T) inventory;
+        }
+        if (capability == Capabilities.FLUID_HANDLER) {
+            return (T) tank;
+        }
+        if (capability == Capabilities.ENERGY_STORAGE && Config.robotsUseEnergy()) {
+            return (T) energy;
+        }
+        if (capability == Capabilities.ROBOT) {
+            return (T) this;
+        }
+        if (capability == Capabilities.TERMINAL_USER_PROVIDER) {
+            return (T) this;
+        }
+
+        for (final CapabilityProvider capabilityProvider : capabilityProviders) {
+            final T value = capabilityProvider.getCapability(capability, side);
+            if (value != null) {
+                return value;
+            }
+        }
+
+        return null;
+    }
+
+    public long getLastPistonMovement() {
+        return lastPistonMovement;
+    }
+
+    public void move(final Vec3 delta, final List<Entity> ignoredColliders) {
+        this.ignoredColliders = ignoredColliders; //NOPMD - read by canCollideWith during move
+        move(MoverType.SELF, delta);
+        this.ignoredColliders = List.of();
+    }
+
+    public void start() {
+        if (!level().isClientSide()) {
+            virtualMachine.start();
+        }
+    }
+
+    public void shutdown() {
+        if (!level().isClientSide()) {
+            virtualMachine.shutdown();
+        }
+    }
+
+    public void reboot() {
+        if (!level().isClientSide()) {
+            virtualMachine.reboot();
+        }
+    }
+
+    public void stop() {
+        if (!level().isClientSide()) {
+            virtualMachine.stop();
+        }
+    }
+
+    public void openTerminalScreen(final ServerPlayer player) {
+        // For full terminal snapshot.
+        Network.sendToClient(new RobotInitializationMessage(this), player);
+
+        RobotTerminalContainer.createServer(this, energy, virtualMachine.getBusController(), player);
+    }
+
+    public void openInventoryScreen(final ServerPlayer player) {
+        RobotInventoryContainer.createServer(this, energy, virtualMachine.getBusController(), player);
+    }
+
+    public void addTerminalUser(final Player player) {
+        terminalUsers.add(player);
+        updateTerminalRecipients();
+    }
+
+    public void removeTerminalUser(final Player player) {
+        terminalUsers.remove(player);
+        updateTerminalRecipients();
+    }
+
+    @Override
+    public Iterable<Player> getTerminalUsers() {
+        return terminalUsers;
+    }
+
+    public void dropSelf() {
+        if (!isAlive()) {
+            return;
+        }
+
+        final ItemStack stack = new ItemStack(Items.ROBOT.get());
+        exportToItemStack(stack);
+        if (level() instanceof final ServerLevel serverLevel) {
+            spawnAtLocation(serverLevel, stack);
+        }
+
+        discard();
+        LevelUtils.playSound(level(), blockPosition(), SoundType.METAL, SoundType::getBreakSound);
+    }
+
+    @Override
+    public void tick() {
+        final boolean isClient = level().isClientSide();
+
+        if (firstTick) {
+            if (isClient) {
+                requestInitialState();
+            } else {
+                registerListeners();
+
+                if (origin == null || !origin.dimension().equals(level().dimension())) {
+                    calibratePosition();
+                }
+            }
+        }
+
+        super.tick();
+
+        if (isClient && terminal.consumePendingBell()) {
+            TerminalBell.play();
+        }
+
+        if (isClient) {
+            animationState.tick();
+        }
+
+        if (!isClient) {
+            virtualMachine.tick();
+        }
+
+        actionProcessor.tick();
+
+        if (!isClient && level() instanceof final ServerLevel serverLevel) {
+            // Getting stuck in a block should be rare / impossible unless world-editing,
+            // so we avoid checking this every frame.
+            final AABB bounds = getBoundingBox();
+            if (--containingBlockSweepCountdown <= 0 || !bounds.equals(lastContainingBlockSweepBounds)) {
+                containingBlockSweepCountdown = CONTAINING_BLOCK_CHECK_INTERVAL;
+                lastContainingBlockSweepBounds = bounds;
+                clearContainingBlocks(serverLevel, bounds);
+            }
+        }
+    }
+
+    @Override
+    public boolean skipAttackInteraction(final Entity entity) {
+        if (entity instanceof Player player && player.isCreative()) {
+            dropSelf();
+        }
+        return true;
+    }
+
+    @Override
+    public InteractionResult interact(final Player player, final InteractionHand hand, final Vec3 location) {
+        final ItemStack stack = player.getItemInHand(hand);
+        if (!level().isClientSide()) {
+            if (Wrenches.isWrench(stack)) {
+                if (player.isShiftKeyDown()) {
+                    dropSelf();
+                } else if (player instanceof final ServerPlayer serverPlayer) {
+                    openInventoryScreen(serverPlayer);
+                }
+            } else {
+                if (player.isShiftKeyDown()) {
+                    start();
+                } else if (player instanceof final ServerPlayer serverPlayer) {
+                    openTerminalScreen(serverPlayer);
+                }
+            }
+        }
+
+        return InteractionResult.SUCCESS;
+    }
+
+    @Override
+    public void setLevelCallback(final EntityInLevelCallback callback) {
+        super.setLevelCallback(callback);
+
+        if (!level().isClientSide()) {
+            final RemovalReason reason = getRemovalReason();
+            if (callback == EntityInLevelCallback.NULL && reason != null) {
+                if (reason.shouldDestroy()) {
+                    handleDestroy();
+                } else {
+                    handleUnload();
+                }
+            }
+        }
+    }
+
+    @Override
+    protected InterpolationHandler createInterpolationHandler() {
+        return new InterpolationHandler.NoOpInterpolationHandler() {
+            @Override
+            public boolean interpolateTo(@Nullable final PositionPath position, final float yRot, final float xRot, final boolean hasRotation) {
+                // Applying server position and rotation while animating (which also runs on client) causes jitter, so
+                // only snap to the authoritative values when actually relevant.
+                if (position != null) {
+                    final Vec3 target = position.endPosition();
+                    if (RobotMovementAction.isComplete(Robot.this) ||
+                        position().distanceToSqr(target) > MOVING_POSITION_SYNC_THRESHOLD * MOVING_POSITION_SYNC_THRESHOLD) {
+                        setPos(target);
+                    }
+                }
+                if (hasRotation && (RobotRotationAction.isComplete(Robot.this) ||
+                    Mth.degreesDifferenceAbs(getYRot(), yRot) > TURNING_ROTATION_SYNC_THRESHOLD)) {
+                    setRot(yRot, xRot);
+                }
+                return true;
+            }
+        };
+    }
+
+    @Override
+    public boolean isPickable() {
+        return true;
+    }
+
+    @Override
+    public boolean canCollideWith(final Entity entity) {
+        return !ignoredColliders.contains(entity) && AbstractBoat.canVehicleCollide(this, entity);
+    }
+
+    @Override
+    public boolean canBeCollidedWith(@Nullable final Entity other) {
+        return true;
+    }
+
+    @Override
+    public boolean hurtServer(final ServerLevel level, final DamageSource source, final float damage) {
+        if (!isInvulnerableToBase(source)) {
+            markHurt();
+        }
+        return false;
+    }
+
+    @Override
+    public boolean canSpawnSprintParticle() {
+        return false;
+    }
+
+    public void exportToItemStack(final ItemStack stack) {
+        final HolderLookup.Provider registries = level().registryAccess();
+        ItemStackUtils.modifyModDataTag(stack, modTag -> {
+            final CompoundTag itemsTag = NBTUtils.getOrCreateChildTag(modTag, ITEMS_TAG_NAME);
+            deviceItems.saveItems(registries, itemsTag); // One tag per device type, as TooltipUtils expects.
+            itemsTag.put(INVENTORY_TAG_NAME, inventory.serializeNBT(registries)); // Won't show up in tooltip.
+
+            modTag.put(TANK_TAG_NAME, tank.serializeNBT(registries));
+            modTag.put(ENERGY_TAG_NAME, energy.serializeNBT());
+        });
+    }
+
+    public void importFromItemStack(final ItemStack stack) {
+        final HolderLookup.Provider registries = level().registryAccess();
+        final CompoundTag modTag = ItemStackUtils.getModDataTag(stack);
+
+        final CompoundTag itemsTag = NBTUtils.getChildTag(modTag, ITEMS_TAG_NAME);
+        deviceItems.loadItems(registries, itemsTag);
+        inventory.deserializeNBT(registries, itemsTag.getCompoundOrEmpty(INVENTORY_TAG_NAME));
+
+        tank.deserializeNBT(registries, NBTUtils.getChildTag(modTag, TANK_TAG_NAME));
+        energy.deserializeNBT(NBTUtils.getChildTag(modTag, ENERGY_TAG_NAME));
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void defineSynchedData(final SynchedEntityData.Builder builder) {
+        builder.define(TARGET_POSITION, BlockPos.ZERO);
+        builder.define(TARGET_DIRECTION, Direction.NORTH);
+        builder.define(SELECTED_SLOT, (byte) 0);
+        builder.define(STATUS_COLOR, DEFAULT_STATUS_COLOR);
+        builder.define(STATUS_VALUE, DEFAULT_STATUS_VALUE);
+    }
+
+    @Override
+    protected void addAdditionalSaveData(final ValueOutput output) {
+        final CompoundTag tag = new CompoundTag();
+        addAdditionalSaveData(tag);
+        output.store(NBTUtils.FLAT_COMPOUND, tag);
+    }
+
+    @Override
+    protected void readAdditionalSaveData(final ValueInput input) {
+        readAdditionalSaveData(input.read(NBTUtils.FLAT_COMPOUND).orElseGet(CompoundTag::new));
+    }
+
+    private void addAdditionalSaveData(final CompoundTag tag) {
+        if (virtualMachine.getRunState() != VMRunState.STOPPED) {
+            tag.put(STATE_TAG_NAME, virtualMachine.serialize());
+            synchronized (terminal) {
+                tag.put(TERMINAL_TAG_NAME, NBTSerialization.serialize(terminal));
+            }
+        }
+
+        tag.put(COMMAND_PROCESSOR_TAG_NAME, actionProcessor.serialize());
+        tag.put(BUS_ELEMENT_TAG_NAME, busElement.serialize());
+        final HolderLookup.Provider registries = level().registryAccess();
+        tag.put(ITEMS_TAG_NAME, deviceItems.saveItems(registries));
+        tag.put(DEVICES_TAG_NAME, deviceItems.saveDevices());
+        tag.put(ENERGY_TAG_NAME, energy.serializeNBT());
+        tag.put(INVENTORY_TAG_NAME, inventory.serializeNBT(registries));
+        tag.put(TANK_TAG_NAME, tank.serializeNBT(registries));
+        tag.putByte(SELECTED_SLOT_TAG_NAME, getEntityData().get(SELECTED_SLOT));
+        tag.putInt(STATUS_COLOR_TAG_NAME, getStatusColor());
+        tag.putFloat(STATUS_VALUE_TAG_NAME, getStatusValue());
+        if (origin != null) {
+            GlobalPos.CODEC.encodeStart(NbtOps.INSTANCE, origin).result().ifPresent(value -> tag.put(ORIGIN_TAG_NAME, value));
+        }
+    }
+
+    private void readAdditionalSaveData(final CompoundTag tag) {
+        virtualMachine.deserialize(tag.getCompoundOrEmpty(STATE_TAG_NAME));
+        NBTSerialization.deserialize(tag.getCompoundOrEmpty(TERMINAL_TAG_NAME), terminal);
+        actionProcessor.deserialize(tag.getCompoundOrEmpty(COMMAND_PROCESSOR_TAG_NAME));
+        busElement.deserialize(tag.getCompoundOrEmpty(BUS_ELEMENT_TAG_NAME));
+        final HolderLookup.Provider registries = level().registryAccess();
+        deviceItems.resetDevices();
+        deviceItems.loadItems(registries, tag.getCompoundOrEmpty(ITEMS_TAG_NAME));
+        deviceItems.loadDevices(tag.getCompoundOrEmpty(DEVICES_TAG_NAME));
+        energy.deserializeNBT(tag.getCompoundOrEmpty(ENERGY_TAG_NAME));
+        inventory.deserializeNBT(registries, tag.getCompoundOrEmpty(INVENTORY_TAG_NAME));
+        tank.deserializeNBT(registries, tag.getCompoundOrEmpty(TANK_TAG_NAME));
+        setSelectedSlot(tag.getByteOr(SELECTED_SLOT_TAG_NAME, (byte) 0));
+        setStatusColor(tag.getIntOr(STATUS_COLOR_TAG_NAME, DEFAULT_STATUS_COLOR));
+        setStatusValue(tag.getFloatOr(STATUS_VALUE_TAG_NAME, DEFAULT_STATUS_VALUE));
+        origin = tag.contains(ORIGIN_TAG_NAME) ? GlobalPos.CODEC.parse(NbtOps.INSTANCE, tag.get(ORIGIN_TAG_NAME)).result().orElse(null) : null;
+
+        RobotActions.initializeData(this);
+        final AbstractRobotAction currentAction = actionProcessor.action;
+        if (currentAction != null) {
+            currentAction.initialize(this);
+        }
+    }
+
+    @Override
+    protected Entity.MovementEmission getMovementEmission() {
+        return Entity.MovementEmission.NONE;
+    }
+
+    @Override
+    protected boolean isAffectedByBlocks() {
+        return false;
+    }
+
+    @Override
+    protected Vec3 limitPistonMovement(final Vec3 pos) {
+        lastPistonMovement = level().getGameTime();
+        return super.limitPistonMovement(pos);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private int cpuEnergyPerTick() {
+        return Config.robotCpuEnergyPerTick(deviceItems.getArchitectureType().orElse(null));
+    }
+
+    @Environment(EnvType.CLIENT)
+    private void requestInitialState() {
+        Network.sendToServer(new RobotInitializationRequestMessage(this));
+    }
+
+    private void registerListeners() {
+        ServerScheduler.scheduleOnUnload(level(), unloadListener);
+    }
+
+    private void unregisterListeners() {
+        ServerScheduler.cancelOnUnload(level(), unloadListener);
+    }
+
+    private BlockPos getBodyPosition() {
+        return BlockPos.containing(getBoundingBox().getCenter());
+    }
+
+    private void calibratePosition() {
+        origin = GlobalPos.of(level().dimension(), getBodyPosition());
+    }
+
+    private void handleUnload() {
+        unregisterListeners();
+        virtualMachine.suspend();
+        virtualMachine.dispose();
+    }
+
+    private void handleDestroy() {
+        unregisterListeners();
+        virtualMachine.stop();
+        virtualMachine.dispose();
+    }
+
+    private void handleAfterDeviceScan() {
+        capabilityProviders.clear();
+        for (final Device device : virtualMachine.getBusController().getDevices()) {
+            if (device instanceof final CapabilityProvider capabilityProvider) {
+                capabilityProviders.add(capabilityProvider);
+            }
+        }
+    }
+
+    private void updateTerminalRecipients() {
+        final ArrayList<ServerPlayer> recipients = new ArrayList<>();
+        for (final Player player : terminalUsers) {
+            if (player instanceof final ServerPlayer serverPlayer) {
+                recipients.add(serverPlayer);
+            }
+        }
+
+        terminalRecipients = List.copyOf(recipients);
+    }
+
+    private void clearContainingBlocks(final ServerLevel serverLevel, final AABB bounds) {
+        final VoxelShape shape = Shapes.create(bounds);
+        final Cursor3D iterator = getBlockPosIterator();
+        while (iterator.advance()) {
+            final int x = iterator.nextX();
+            final int y = iterator.nextY();
+            final int z = iterator.nextZ();
+            mutablePosition.set(x, y, z);
+            final BlockState blockState = serverLevel.getBlockState(mutablePosition);
+            if (blockState.isAir() ||
+                blockState.is(Blocks.MOVING_PISTON) ||
+                blockState.is(Blocks.PISTON_HEAD)) {
+                continue;
+            }
+
+            final VoxelShape blockShape = blockState.getCollisionShape(serverLevel, mutablePosition);
+            if (Shapes.joinIsNotEmpty(shape, blockShape.move(x, y, z), BooleanOp.AND)) {
+                tryClearContainingBlock(serverLevel, mutablePosition.immutable(), blockState);
+            }
+        }
+    }
+
+    private Cursor3D getBlockPosIterator() {
+        final AABB bounds = getBoundingBox();
+        return new Cursor3D(
+            Mth.floor(bounds.minX), Mth.floor(bounds.minY), Mth.floor(bounds.minZ),
+            Mth.floor(bounds.maxX), Mth.floor(bounds.maxY), Mth.floor(bounds.maxZ)
+        );
+    }
+
+    private void tryClearContainingBlock(final ServerLevel level, final BlockPos blockPos, final BlockState blockState) {
+        // Quick and dirty pre-fake-player check.
+        if (blockState.getDestroySpeed(level, blockPos) < 0) {
+            return;
+        }
+
+        final ServerPlayer player = FakePlayerUtils.getFakePlayer(level, this);
+
+        if (!LevelUtils.fireBlockBreak(level, player, blockPos, blockState)) {
+            return;
+        }
+
+        if (!level.destroyBlock(blockPos, true, player)) {
+            // We tried being nice... kill it. Might revisit this :D
+            level.setBlockAndUpdate(blockPos, Blocks.AIR.defaultBlockState());
+        }
+    }
+
+    private static float lerpClamped(final float from, final float to, final float delta) {
+        if (from < to) {
+            return Math.min(from + delta, to);
+        } else if (from > to) {
+            return Math.max(from - delta, to);
+        } else {
+            return from;
+        }
+    }
+
+    private static float remapFrom01To(final float x, final float a1, final float b1) {
+        if (a1 == b1) {
+            return a1;
+        } else {
+            return x * (b1 - a1) + a1;
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public final class AnimationState {
+        public static final float TOP_IDLE_Y = -2f / 16f;
+        private static final float BASE_IDLE_Y = -1f / 16f;
+
+        private static final float TRANSLATION_SPEED = 0.015f;
+        private static final float ROTATION_SPEED = 1f;
+        private static final float MAX_ROTATION = 5f;
+        private static final float MIN_ROTATION_SPEED = 0.165f;
+        private static final float MAX_ROTATION_SPEED = 0.180f;
+        private static final float HOVER_ANIMATION_SPEED = 0.03f;
+
+        private float topRenderOffsetY = TOP_IDLE_Y;
+        private float baseRenderOffsetY = BASE_IDLE_Y;
+        private float topRenderRotationY;
+        private float topRenderOffsetYO = TOP_IDLE_Y;
+        private float baseRenderOffsetYO = BASE_IDLE_Y;
+        private float topRenderRotationYO;
+        private float topRenderTargetRotationY;
+        private float topRenderRotationSpeed;
+        private final float hoverPhase = hashCode() & 0xFFFF;
+
+        public float getTopRenderOffsetY(final float partialTicks) {
+            return Mth.lerp(partialTicks, topRenderOffsetYO, topRenderOffsetY);
+        }
+
+        public float getBaseRenderOffsetY(final float partialTicks) {
+            return Mth.lerp(partialTicks, baseRenderOffsetYO, baseRenderOffsetY);
+        }
+
+        public float getTopRenderRotationY(final float partialTicks) {
+            return Mth.lerp(partialTicks, topRenderRotationYO, topRenderRotationY);
+        }
+
+        private void tick() {
+            topRenderOffsetYO = topRenderOffsetY;
+            baseRenderOffsetYO = baseRenderOffsetY;
+            topRenderRotationYO = topRenderRotationY;
+
+            if (getVirtualMachine().isRunning() || actionProcessor.hasQueuedActions()) {
+                final float topOffsetY = (float) Math.sin(level().getGameTime() * HOVER_ANIMATION_SPEED + hoverPhase) / 32f;
+
+                topRenderOffsetY = lerpClamped(topRenderOffsetY, topOffsetY, TRANSLATION_SPEED);
+                baseRenderOffsetY = lerpClamped(baseRenderOffsetY, topOffsetY, TRANSLATION_SPEED);
+
+                topRenderRotationY = lerpClamped(topRenderRotationY, topRenderTargetRotationY, topRenderRotationSpeed);
+                if (topRenderRotationY == topRenderTargetRotationY) {
+                    topRenderTargetRotationY = remapFrom01To(random.nextFloat(), -MAX_ROTATION, MAX_ROTATION);
+                    topRenderRotationSpeed = remapFrom01To(random.nextFloat(), MIN_ROTATION_SPEED, MAX_ROTATION_SPEED);
+                }
+            } else {
+                topRenderOffsetY = lerpClamped(topRenderOffsetY, TOP_IDLE_Y, TRANSLATION_SPEED * 2);
+                baseRenderOffsetY = lerpClamped(baseRenderOffsetY, BASE_IDLE_Y, TRANSLATION_SPEED);
+
+                topRenderRotationY = lerpClamped(topRenderRotationY, 0, ROTATION_SPEED);
+            }
+        }
+    }
+
+    private static final class RobotActionProcessorResult {
+        private static final String ACTION_ID_TAG_NAME = "action_id";
+        private static final String RESULT_TAG_NAME = "result";
+
+        public int actionId;
+        public RobotActionResult result;
+
+        public RobotActionProcessorResult(final int actionId, final RobotActionResult result) {
+            this.actionId = actionId;
+            this.result = result;
+        }
+
+        public RobotActionProcessorResult(final CompoundTag tag) {
+            deserialize(tag);
+        }
+
+        public CompoundTag serialize() {
+            final CompoundTag tag = new CompoundTag();
+
+            tag.putInt(ACTION_ID_TAG_NAME, actionId);
+            NBTUtils.putEnum(tag, RESULT_TAG_NAME, result);
+
+            return tag;
+        }
+
+        public void deserialize(final CompoundTag tag) {
+            actionId = tag.getIntOr(ACTION_ID_TAG_NAME, 0);
+            result = NBTUtils.getEnum(tag, RESULT_TAG_NAME, RobotActionResult.class);
+        }
+    }
+
+    private final class RobotActionProcessor {
+        private static final String QUEUE_TAG_NAME = "queue";
+        private static final String ACTION_TAG_NAME = "action";
+        private static final String RESULTS_TAG_NAME = "results";
+        private static final String LAST_ACTION_ID_TAG_NAME = "last_action_id";
+
+        private final Queue<AbstractRobotAction> queue = new ArrayDeque<>(MAX_QUEUED_ACTIONS - 1);
+        @Nullable
+        private volatile AbstractRobotAction action; // VM -> server thread
+
+        private final Queue<RobotActionProcessorResult> results = new ArrayDeque<>(MAX_QUEUED_RESULTS);
+        private int lastActionId;
+
+        public boolean hasQueuedActions() {
+            synchronized (queue) {
+                return action != null || !queue.isEmpty();
+            }
+        }
+
+        public int getQueuedActionCount() {
+            synchronized (queue) {
+                return (action != null ? 1 : 0) + queue.size();
+            }
+        }
+
+        public boolean move(final MovementDirection direction) {
+            return addAction(new RobotMovementAction(direction));
+        }
+
+        public boolean rotate(final RotationDirection direction) {
+            return addAction(new RobotRotationAction(direction));
+        }
+
+        public void tick() {
+            if (level().isClientSide()) {
+                RobotActions.performClient(Robot.this);
+            } else {
+                if (action != null) {
+                    final RobotActionResult result = action.perform(Robot.this);
+                    if (result != RobotActionResult.INCOMPLETE) {
+                        final int actionId = action.getId();
+
+                        synchronized (results) {
+                            if (results.size() == MAX_QUEUED_RESULTS) {
+                                results.remove();
+                            }
+
+                            results.add(new RobotActionProcessorResult(actionId, result));
+                        }
+
+                        action = null;
+
+                        robotDevice.contexts.sendEvent(RobotActionCompletedEvent.TYPE, new RobotActionCompletedEvent(actionId, result));
+                        robotDevice.contexts.sendEvent(RobotDevice.ACTION_COMPLETED_EVENT_CODE, actionId & 0xFFFF);
+                    }
+                }
+                if (action == null) {
+                    synchronized (queue) {
+                        action = queue.poll();
+                    }
+                    if (action != null) {
+                        action.initialize(Robot.this);
+                    }
+                }
+                RobotActions.performServer(Robot.this, action);
+            }
+        }
+
+        public void clear() {
+            synchronized (queue) {
+                queue.clear();
+            }
+            synchronized (results) {
+                results.clear();
+            }
+        }
+
+        public CompoundTag serialize() {
+            final CompoundTag tag = new CompoundTag();
+
+            final ListTag queueTag = new ListTag();
+            synchronized (queue) {
+                for (final AbstractRobotAction action : queue) {
+                    queueTag.add(RobotActions.serialize(action));
+                }
+            }
+            tag.put(QUEUE_TAG_NAME, queueTag);
+
+            final AbstractRobotAction currentAction = action;
+            if (currentAction != null) {
+                tag.put(ACTION_TAG_NAME, RobotActions.serialize(currentAction));
+            }
+
+            final ListTag resultsTag = new ListTag();
+            synchronized (results) {
+                for (final RobotActionProcessorResult result : results) {
+                    resultsTag.add(result.serialize());
+                }
+            }
+            tag.put(RESULTS_TAG_NAME, resultsTag);
+
+            synchronized (queue) {
+                tag.putInt(LAST_ACTION_ID_TAG_NAME, lastActionId);
+            }
+
+            return tag;
+        }
+
+        public void deserialize(final CompoundTag tag) {
+            final ListTag queueTag = tag.getListOrEmpty(QUEUE_TAG_NAME);
+            synchronized (queue) {
+                queue.clear();
+                for (int i = 0; i < Math.min(queueTag.size(), MAX_QUEUED_ACTIONS - 1); i++) {
+                    final AbstractRobotAction action = RobotActions.deserialize(queueTag.getCompoundOrEmpty(i));
+                    if (action != null) {
+                        queue.add(action);
+                    }
+                }
+                lastActionId = tag.getIntOr(LAST_ACTION_ID_TAG_NAME, 0);
+            }
+
+            action = RobotActions.deserialize(tag.getCompoundOrEmpty(ACTION_TAG_NAME));
+
+            final ListTag resultsTag = tag.getListOrEmpty(RESULTS_TAG_NAME);
+            synchronized (results) {
+                results.clear();
+                for (int i = 0; i < Math.min(resultsTag.size(), MAX_QUEUED_RESULTS); i++) {
+                    final RobotActionProcessorResult result = new RobotActionProcessorResult(resultsTag.getCompoundOrEmpty(i));
+                    if (result.actionId != 0) {
+                        results.add(result);
+                    }
+                }
+            }
+        }
+
+        private boolean addAction(final AbstractRobotAction action) {
+            if (level().isClientSide()) {
+                return false;
+            }
+
+            if (!getVirtualMachine().isRunning()) {
+                return false;
+            }
+
+            synchronized (queue) {
+                if (queue.size() >= MAX_QUEUED_ACTIONS - 1) { // -1 for current action
+                    return false;
+                }
+
+                lastActionId = (lastActionId + 1) & 0x7FFFFFFF; // only positive ids; unlikely to ever wrap, but eh.
+                action.setId(lastActionId);
+                queue.add(action);
+                return true;
+            }
+        }
+    }
+
+    private final class RobotItemStackHandlers extends AbstractVMItemStackHandlers {
+        public RobotItemStackHandlers() {
+            super(
+                new GroupDefinition(DeviceTypes.CPU.get(), CPU_SLOTS),
+                new GroupDefinition(DeviceTypes.MEMORY.get(), MEMORY_SLOTS),
+                new GroupDefinition(DeviceTypes.HARD_DRIVE.get(), HARD_DRIVE_SLOTS),
+                new GroupDefinition(DeviceTypes.FLOPPY.get(), FLOPPY_SLOTS),
+                new GroupDefinition(DeviceTypes.FLASH_MEMORY.get(), FLASH_MEMORY_SLOTS),
+                new GroupDefinition(DeviceTypes.ROBOT_MODULE.get(), MODULE_SLOTS)
+            );
+        }
+
+        @Override
+        protected boolean isClientSide() {
+            return level().isClientSide();
+        }
+
+        @Override
+        protected ItemDeviceQuery makeQuery(final ItemStack stack) {
+            return Devices.makeQuery(deviceItems.getArchitectureType().orElse(null), Robot.this, stack);
+        }
+
+        @Override
+        protected void onChanged() {
+            super.onChanged();
+            if (!level().isClientSide()) {
+                virtualMachine.getBusController().scheduleBusScan();
+            }
+        }
+    }
+
+    private final class RobotBusElement extends AbstractDeviceBusElement {
+        private static final String DEVICE_ID_TAG_NAME = "device_id";
+
+        private final Device device = new ObjectDevice(robotDevice);
+        private UUID deviceId = UUID.randomUUID();
+
+        @Override
+        public Optional<Collection<DeviceBusElement>> getNeighbors() {
+            return Optional.of(singleton(deviceItems.busElement));
+        }
+
+        @Override
+        public Collection<Device> getLocalDevices() {
+            return singleton(device);
+        }
+
+        @Override
+        public Optional<UUID> getDeviceIdentifier(final Device device) {
+            if (device == this.device) {
+                return Optional.of(deviceId);
+            }
+            return super.getDeviceIdentifier(device);
+        }
+
+        public CompoundTag serialize() {
+            final CompoundTag tag = new CompoundTag();
+            tag.store(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC, deviceId);
+            return tag;
+        }
+
+        public void deserialize(final CompoundTag tag) {
+            if (tag.read(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC).isPresent()) {
+                deviceId = tag.read(DEVICE_ID_TAG_NAME, UUIDUtil.CODEC).orElseThrow();
+            }
+        }
+    }
+
+    private final class RobotVMRunner extends AbstractTerminalVMRunner {
+        public RobotVMRunner(final AbstractArchitecture architecture, final Terminal terminal) {
+            super(architecture, terminal);
+        }
+
+        @Override
+        protected void sendTerminalUpdateToClient(final ByteBuffer output) {
+            final List<ServerPlayer> recipients = terminalRecipients;
+            if (recipients.isEmpty()) {
+                return;
+            }
+
+            final RobotTerminalOutputMessage message = new RobotTerminalOutputMessage(Robot.this, output);
+            for (final ServerPlayer player : recipients) {
+                Network.sendToClient(message, player);
+            }
+        }
+    }
+
+    private final class RobotVirtualMachine extends AbstractVirtualMachine {
+        private RobotVirtualMachine(final CommonDeviceBusController busController) {
+            super(busController);
+            setDeviceLocationProvider(deviceItems::getDeviceLocation);
+        }
+
+        @Override
+        protected boolean consumeEnergy(final int amount, final boolean simulate) {
+            if (!Config.robotsUseEnergy()) {
+                return true;
+            }
+
+            if (amount > energy.getEnergyStored()) {
+                return false;
+            }
+
+            energy.extractEnergy(amount, simulate);
+            return true;
+        }
+
+        @Override
+        protected void stopRunnerAndReset() {
+            super.stopRunnerAndReset();
+
+            TerminalUtils.resetTerminal(terminal, output -> {
+                for (final ServerPlayer player : terminalRecipients) {
+                    Network.sendToClient(new RobotTerminalOutputMessage(Robot.this, output), player);
+                }
+            });
+
+            actionProcessor.clear();
+
+            setStatusColor(DEFAULT_STATUS_COLOR);
+            setStatusValue(DEFAULT_STATUS_VALUE);
+        }
+
+        @Override
+        protected AbstractTerminalVMRunner createRunner(final AbstractArchitecture architecture) {
+            return new RobotVMRunner(architecture, terminal);
+        }
+
+        @Override
+        protected void handleBusStateChanged(final CommonDeviceBusController.BusState value) {
+            Network.sendToClientsTrackingEntity(new RobotBusStateMessage(Robot.this, value), Robot.this);
+        }
+
+        @Override
+        protected void handleRunStateChanged(final VMRunState value) {
+            Network.sendToClientsTrackingEntity(new RobotRunStateMessage(Robot.this, value), Robot.this);
+        }
+
+        @Override
+        protected void handleBootErrorChanged(@Nullable final Component value) {
+            Network.sendToClientsTrackingEntity(new RobotBootErrorMessage(Robot.this, value), Robot.this);
+        }
+    }
+
+    @RPCDeviceDescription(typeName = "robot", description = """
+        Provided by the [robot](../item/robot.md).
+
+        ### Directions
+        The direction parameter in the following methods represents a direction relative to the robot. Valid values are: `forward`, `backward`, `upward`, `downward` for movement actions, `left` and `right` for rotation actions. These directions are always from the point of view of the robot at the time it executes an action.
+
+        Short form aliases of these values can be used for convenience: `back`, `up`, `down`. For extreme brevity, the initial letter of each direction can be used as well.
+
+        ### Sides
+        The side parameter of `detect()` represents a face of the robot rather than a movement direction. Valid values are: `front`, `up` and `down`.
+
+        ### Position
+        `getFacing()` reports a compass direction: `north`, `east`, `south` or `west`. `getPosition()` reports where the robot is relative to its origin, in blocks. `x` grows towards east, `y` upward and `z` towards south. The origin is where the robot was placed, until `calibratePosition()` moves it to where the robot is now. The position stays correct however the robot gets moved, pistons included. Breaking the robot clears the origin, changing dimension resets it to the new position.
+
+        Note that the `robot` Lua library described in the [robot](../item/robot.md) entry offers useful wrappers for all of these methods. It is recommended to use the library instead of interacting with the device directly.""")
+    @IODeviceDescription(name = "ROBOT", description = """
+        Directions and sides are numbered. Movement directions are `0` forward, `1` backward, `2` upward and `3` downward. Rotation directions are `0` left and `1` right. Sides for `detect` are `0` front, `1` up and `2` down. Anything outside those ranges fails with `OCEARG`. Facings are `0` north, `1` east, `2` south and `3` west. Item and fluid ids are two bytes, low byte first; [`SYSTEM`](system.md) provides name lookup.
+
+        ### Events
+        `1 actionCompleted` is sent when an action finishes. The value is its id; `getActionResult` tells how it turned out.""")
+    public final class RobotDevice implements LifecycleAwareDevice {
+        public record Position(int x, int y, int z) {
+        }
+
+        private static final String DETECT_AIR = "air";
+        private static final String DETECT_FLUID = "fluid";
+        private static final String DETECT_SOLID = "solid";
+
+        private static final int DETECT_CODE = 1;
+        private static final int GET_ENERGY_STORED_CODE = 2;
+        private static final int GET_ENERGY_CAPACITY_CODE = 3;
+        private static final int GET_SELECTED_SLOT_CODE = 4;
+        private static final int SET_SELECTED_SLOT_CODE = 5;
+        private static final int GET_STACK_IN_SLOT_CODE = 6;
+        private static final int MOVE_CODE = 7;
+        private static final int TURN_CODE = 8;
+        private static final int GET_LAST_ACTION_ID_CODE = 9;
+        private static final int GET_QUEUED_ACTION_COUNT_CODE = 10;
+        private static final int GET_ACTION_RESULT_CODE = 11;
+        private static final int GET_STATUS_COLOR_CODE = 12;
+        private static final int SET_STATUS_COLOR_CODE = 13;
+        private static final int GET_STATUS_VALUE_CODE = 14;
+        private static final int SET_STATUS_VALUE_CODE = 15;
+        private static final int GET_FLUID_CODE = 16;
+        private static final int GET_FACING_CODE = 17;
+        private static final int GET_POSITION_CODE = 18;
+        private static final int CALIBRATE_POSITION_CODE = 19;
+
+        private static final int ACTION_COMPLETED_EVENT_CODE = 1;
+
+        private static final MovementDirection[] IO_MOVEMENTS = {
+            MovementDirection.FORWARD, MovementDirection.BACKWARD, MovementDirection.UPWARD, MovementDirection.DOWNWARD};
+        private static final Direction[] IO_FACINGS = {
+            Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
+        private static final RotationDirection[] IO_ROTATIONS = {
+            RotationDirection.LEFT, RotationDirection.RIGHT};
+
+        private final DeviceContext contexts = new DeviceContext();
+
+        // ----------------------------------------------------------------- //
+
+        @Override
+        public void onDeviceMounted(final RPCBusContext context) {
+            contexts.add(context);
+        }
+
+        @Override
+        public void onDeviceUnmounted(final RPCBusContext context) {
+            contexts.remove(context);
+        }
+
+        @Override
+        public void onIODeviceMounted(final IOBusContext context) {
+            contexts.add(context);
+        }
+
+        @Override
+        public void onIODeviceUnmounted(final IOBusContext context) {
+            contexts.remove(context);
+        }
+
+        // ----------------------------------------------------------------- //
+
+        @Callback(description = "Gets the compass direction the robot is facing.",
+            returnValueDescription = "`north`, `east`, `south` or `west`.")
+        public String getFacing() {
+            return getDirection().getSerializedName();
+        }
+
+        @Callback(description = "Gets the robot's position relative to its origin.",
+            returnValueDescription = "the offset from the origin in `x`, `y` and `z`, in blocks.")
+        public Position getPosition() {
+            final BlockPos offset = getBodyPosition().subtract(origin.pos());
+            return new Position(offset.getX(), offset.getY(), offset.getZ());
+        }
+
+        @Callback(description = "Makes the robot's current position its reference origin.")
+        @IOCallback(value = CALIBRATE_POSITION_CODE,
+            description = "Makes the robot's current position its reference origin.")
+        public void calibratePosition() {
+            Robot.this.calibratePosition();
+        }
+
+        @Callback(synchronize = false,
+            description = "Gets the current amount of energy stored in the robot's internal energy storage.",
+            returnValueDescription = "the stored amount of energy.")
+        public int getEnergyStored() {
+            return (int) energy.getEnergyStored();
+        }
+
+        @Callback(synchronize = false,
+            description = "Gets the maximum amount of energy that can be stored in the robot's internal energy storage.",
+            returnValueDescription = "the maximum amount of energy stored.")
+        public int getEnergyCapacity() {
+            return (int) energy.getMaxEnergyStored();
+        }
+
+        @Callback(description = "Gets the currently selected robot inventory slot. This is used by many modules as an implicit input.",
+            returnValueDescription = "the index of the selected inventory slot.")
+        public int getSelectedSlot() {
+            return Robot.this.getSelectedSlot();
+        }
+
+        @Callback(description = "Sets the currently selected robot inventory slot. This is used by many modules as an implicit input.",
+            returnValueDescription = "the index of the newly selected slot. This may differ from `slot` if the specified value was invalid.")
+        public int setSelectedSlot(@Parameter(value = "slot", description = "the index of the inventory slot to select.") final int slot) {
+            Robot.this.setSelectedSlot(slot);
+            return Robot.this.getSelectedSlot();
+        }
+
+        @Callback(description = "Gets a description of the item in the specified slot.",
+            returnValueDescription = "a description of the item in the slot.")
+        public ItemStack getStackInSlot(@Parameter(value = "slot", description = "the index of the slot to get the item description for.") final int slot) {
+            return inventory.getStackInSlot(slot);
+        }
+
+        @Callback(description = "Gets what is in the robot's tank.",
+            returnValueDescription = "a description of the fluid in the tank.")
+        public FluidStack getFluid() {
+            return tank.getFluid();
+        }
+
+        @Callback(description = "Reports what occupies the space on the specified side of the robot. " +
+            "This only tells you whether the space is free, not what is in it.",
+            returnValueDescription = "`solid` if something there blocks movement, `fluid` if the space holds a " +
+                "fluid the robot can move through, or `air` if the space is free. Blocks the robot can pass " +
+                "through, such as grass, count as `air`.")
+        public String detect(@Parameter(value = "side", description = "the side to look at: `front`, `up` or `down`.") @Nullable final RobotOperationSide side) {
+            if (side == null) throw new IllegalArgumentException();
+
+            final Level level = level();
+            final BlockPos pos = blockPosition().relative(RobotOperationSide.toGlobal(Robot.this, side));
+
+            final ChunkPos chunkPos = ChunkPos.containing(pos);
+            if (!level.hasChunk(chunkPos.x(), chunkPos.z())) {
+                return DETECT_SOLID;
+            }
+
+            final BlockState state = level.getBlockState(pos);
+            if (!state.getCollisionShape(level, pos).isEmpty()) {
+                return DETECT_SOLID;
+            }
+
+            if (!state.getFluidState().isEmpty()) {
+                return DETECT_FLUID;
+            }
+
+            return DETECT_AIR;
+        }
+
+        @Callback(synchronize = false,
+            description = "Tries to enqueue a movement action in the specified direction.",
+            returnValueDescription = "whether the action was enqueued successfully.")
+        public boolean move(@Parameter(value = "direction", description = "the direction to move in: `forward`, `backward`, `upward` or `downward`, or a short form.") @Nullable final MovementDirection direction) {
+            if (direction == null) throw new IllegalArgumentException();
+            return actionProcessor.move(direction);
+        }
+
+        @Callback(synchronize = false,
+            description = "Tries to enqueue a turn action towards the specified direction.",
+            returnValueDescription = "whether the action was enqueued successfully.")
+        public boolean turn(@Parameter(value = "direction", description = "the direction to turn towards: `left` or `right`.") @Nullable final RotationDirection direction) {
+            if (direction == null) throw new IllegalArgumentException();
+            return actionProcessor.rotate(direction);
+        }
+
+        @Callback(synchronize = false,
+            description = "Gets the opaque id of the last enqueued action. Call this after a successful `move()` or " +
+                "`turn()` call to obtain the id associated with the enqueued action.",
+            returnValueDescription = "the id of the last enqueued action.")
+        public int getLastActionId() {
+            // Written by addAction under the queue monitor; read it under the same one
+            // or the guest can see an id older than the action it just queued.
+            synchronized (actionProcessor.queue) {
+                return actionProcessor.lastActionId;
+            }
+        }
+
+        @Callback(synchronize = false,
+            description = "Gets the number of actions currently waiting in the action queue to be processed. " +
+                "Use this to wait for actions to finish when enqueueing fails.",
+            returnValueDescription = "the number of currently pending actions.")
+        public int getQueuedActionCount() {
+            return actionProcessor.getQueuedActionCount();
+        }
+
+        @Nullable
+        @Callback(synchronize = false,
+            description = "Gets the result of the action with the specified id. Action ids can be obtained from " +
+                "`getLastActionId()`. Only a limited number of past action results are available.",
+            returnValueDescription = "the result for the specified action id, or nothing if unavailable. When " +
+                "available, possible values are: `INCOMPLETE`, `SUCCESS` and `FAILURE`.")
+        public RobotActionResult getActionResult(@Parameter(value = "actionId", description = "the id of the action to get the result for.") final int actionId) {
+            return findActionResult(id -> id == actionId);
+        }
+
+        @Callback(description = "Gets the color of the status light on the front of the robot.",
+            returnValueDescription = "the current color, as a packed `0xRRGGBB` value.")
+        public int getStatusColor() {
+            return Robot.this.getStatusColor();
+        }
+
+        @Callback(description = "Sets the color of the status light on the front of the robot.",
+            returnValueDescription = "the color that was applied.")
+        public int setStatusColor(@Parameter(value = "color", description = "the color to set, as a packed `0xRRGGBB` value.") final int color) {
+            Robot.this.setStatusColor(color);
+            return Robot.this.getStatusColor();
+        }
+
+        @Callback(description = "Gets how far the status light is filled.",
+            returnValueDescription = "the current fill value, in the range of [0, 1].")
+        public double getStatusValue() {
+            return Robot.this.getStatusValue();
+        }
+
+        @Callback(description = "Sets how far the status light is filled. It fills from the bottom, so zero hides it entirely and one fills it.",
+            returnValueDescription = "the fill value that was applied.")
+        public double setStatusValue(@Parameter(value = "value", description = "the fill value to set, will be clamped to [0, 1].") final double value) {
+            Robot.this.setStatusValue((float) value);
+            return Robot.this.getStatusValue();
+        }
+
+        // ----------------------------------------------------------------- //
+
+        @IOCallback(value = GET_FACING_CODE,
+            description = "Gets the compass direction the robot is facing.",
+            resultsDescription = "one byte, the facing.")
+        public void getFacing(final IOOutputStream results) throws IOException {
+            results.writeU8(Arrays.asList(IO_FACINGS).indexOf(getDirection()));
+        }
+
+        @IOCallback(value = GET_POSITION_CODE,
+            description = "Gets the robot's position relative to its origin.",
+            resultsDescription = "six bytes, the signed two byte offsets `x`, `y` and `z`, each low byte first.")
+        public void getPosition(final IOOutputStream results) throws IOException {
+            final Position position = getPosition();
+            results.writeU16(position.x());
+            results.writeU16(position.y());
+            results.writeU16(position.z());
+        }
+
+        @IOCallback(value = GET_ENERGY_STORED_CODE, synchronize = false,
+            description = "Reads how much energy the robot has left.",
+            resultsDescription = "four bytes, the amount, low byte first.")
+        public void getEnergyStored(final IOOutputStream results) throws IOException {
+            results.writeU32(energy.getEnergyStored());
+        }
+
+        @IOCallback(value = GET_ENERGY_CAPACITY_CODE, synchronize = false,
+            description = "Reads how much energy the robot holds when full.",
+            resultsDescription = "four bytes, the amount, low byte first.")
+        public void getEnergyCapacity(final IOOutputStream results) throws IOException {
+            results.writeU32(energy.getMaxEnergyStored());
+        }
+
+        @IOCallback(value = GET_SELECTED_SLOT_CODE,
+            description = "Reads which inventory slot is selected.",
+            resultsDescription = "one byte, the slot.")
+        public void getSelectedSlot(final IOOutputStream results) throws IOException {
+            results.writeU8(getSelectedSlot());
+        }
+
+        @IOCallback(value = SET_SELECTED_SLOT_CODE,
+            description = "Selects an inventory slot.",
+            argumentsDescription = "one byte, the slot. A slot the robot does not have is clamped into range.",
+            resultsDescription = "one byte, the slot in effect after the call.")
+        public void setSelectedSlot(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            results.writeU8(setSelectedSlot(arguments.readU8()));
+        }
+
+        @IOCallback(value = GET_STACK_IN_SLOT_CODE,
+            description = "Reads what is in an inventory slot.",
+            argumentsDescription = "one byte, the slot. A slot the robot does not have fails with `OCEARG`.",
+            resultsDescription = "four bytes, one slot record in the form the `ITEMS` device uses: the item as two bytes, the number of items, and damage.")
+        public void getStackInSlot(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            ItemHandlerProtocol.writeSlot(inventory, arguments.readU8(), results);
+        }
+
+        @IOCallback(value = GET_FLUID_CODE,
+            description = "Reads what is in the robot's tank.",
+            resultsDescription = "six bytes: the fluid as two bytes and the amount as four bytes. An empty tank reads as fluid 0.")
+        public void getFluid(final IOOutputStream results) throws IOException {
+            FluidHandlerProtocol.writeTankAt(tank, 0, results);
+        }
+
+        @IOCallback(value = DETECT_CODE,
+            description = "Reports what occupies the space on that side.",
+            argumentsDescription = "one byte, the side.",
+            resultsDescription = "one byte: `0` air, `1` fluid, `2` solid. Only `2` stops a move.")
+        public void detect(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            results.writeU8(switch (detect(RobotOperationSide.byIndex(arguments.readU8()))) {
+                case DETECT_AIR -> 0;
+                case DETECT_FLUID -> 1;
+                case DETECT_SOLID -> 2;
+                default -> throw new AssertionError("unmapped detect result");
+            });
+        }
+
+        @IOCallback(value = MOVE_CODE, synchronize = false,
+            description = "Tries to enqueue a movement action in the specified direction.",
+            argumentsDescription = "one byte, the direction.",
+            resultsDescription = "one byte, `1` when the action was enqueued, `0` when the queue was full or the robot was not ready.")
+        public void move(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            results.writeU8(move(fromOrdinal(IO_MOVEMENTS, arguments.readU8())) ? 1 : 0);
+        }
+
+        @IOCallback(value = TURN_CODE, synchronize = false,
+            description = "Tries to enqueue a turn action towards the specified direction.",
+            argumentsDescription = "one byte, the direction.",
+            resultsDescription = "one byte, `1` when the action was enqueued, `0` when the queue was full or the robot was not ready.")
+        public void turn(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            results.writeU8(turn(fromOrdinal(IO_ROTATIONS, arguments.readU8())) ? 1 : 0);
+        }
+
+        @IOCallback(value = GET_LAST_ACTION_ID_CODE, synchronize = false,
+            description = "Gets the opaque id of the last enqueued action. Call this after a successful `move` or " +
+                "`turn` call to obtain the id associated with the enqueued action.",
+            resultsDescription = "two bytes, the id, low byte first.")
+        public void getLastActionId(final IOOutputStream results) throws IOException {
+            results.writeU16(getLastActionId());
+        }
+
+        @IOCallback(value = GET_QUEUED_ACTION_COUNT_CODE, synchronize = false,
+            description = "Gets the number of actions currently waiting in the action queue to be processed. " +
+                "Use this to wait for actions to finish when enqueueing fails.",
+            resultsDescription = "one byte, the count.")
+        public void getQueuedActionCount(final IOOutputStream results) throws IOException {
+            results.writeU8(getQueuedActionCount());
+        }
+
+        @IOCallback(value = GET_ACTION_RESULT_CODE, synchronize = false,
+            description = "Gets the result of the action with the specified id. Returns `1` until the action finishes. " +
+                "May be awaited using the `actionCompleted` event.",
+            argumentsDescription = "two bytes, the id.",
+            resultsDescription = "one byte: `0` unknown, `1` incomplete, `2` success, `3` failure.")
+        public void getActionResult(final IOInputStream arguments, final IOOutputStream results) throws IOException {
+            final int actionId = arguments.readU16();
+            final RobotActionResult result = findActionResult(id -> (id & 0xFFFF) == actionId);
+            results.writeU8(switch (result) {
+                case null -> 0;
+                case INCOMPLETE -> 1;
+                case SUCCESS -> 2;
+                case FAILURE -> 3;
+            });
+        }
+
+        @IOCallback(value = GET_STATUS_COLOR_CODE,
+            description = "Reads the color of the status light.",
+            resultsDescription = "three bytes, the red, green and blue components.")
+        public void getStatusColor(final IOOutputStream results) throws IOException {
+            final int color = getStatusColor();
+            results.writeU8(color >>> 16);
+            results.writeU8((color >>> 8) & 0xFF);
+            results.writeU8(color & 0xFF);
+        }
+
+        @IOCallback(value = SET_STATUS_COLOR_CODE,
+            description = "Sets the color of the status light.",
+            argumentsDescription = "three bytes, the red, green and blue components.")
+        public void setStatusColor(final IOInputStream arguments) throws IOException {
+            setStatusColor((arguments.readU8() << 16) | (arguments.readU8() << 8) | arguments.readU8());
+        }
+
+        @IOCallback(value = GET_STATUS_VALUE_CODE,
+            description = "Reads how far the status light is filled.",
+            resultsDescription = "one byte, the fill value, where `0` is empty and `255` is full.")
+        public void getStatusValue(final IOOutputStream results) throws IOException {
+            results.writeU8((int) Math.round(getStatusValue() * 0xFF));
+        }
+
+        @IOCallback(value = SET_STATUS_VALUE_CODE,
+            description = "Sets how far the status light is filled.",
+            argumentsDescription = "one byte, the fill value, where `0` is empty and `255` is full.")
+        public void setStatusValue(final IOInputStream arguments) throws IOException {
+            setStatusValue(arguments.readU8() / (double) 0xFF);
+        }
+
+        // ----------------------------------------------------------------- //
+
+        @Nullable
+        private RobotActionResult findActionResult(final IntPredicate matches) {
+            final AbstractRobotAction currentAction = actionProcessor.action;
+            if (currentAction != null && matches.test(currentAction.getId())) {
+                return RobotActionResult.INCOMPLETE;
+            }
+            synchronized (actionProcessor.queue) {
+                for (final AbstractRobotAction action : actionProcessor.queue) {
+                    if (matches.test(action.getId())) {
+                        return RobotActionResult.INCOMPLETE;
+                    }
+                }
+            }
+            synchronized (actionProcessor.results) {
+                for (final RobotActionProcessorResult result : actionProcessor.results) {
+                    if (matches.test(result.actionId)) {
+                        return result.result;
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        private static <T> T fromOrdinal(final T[] values, final int code) {
+            if (code >= values.length) {
+                throw new IllegalArgumentException("value out of range: " + code
+                    + " (expected 0 to " + (values.length - 1) + ")");
+            }
+            return values[code];
+        }
+
+        // ----------------------------------------------------------------- //
+
+        private RobotDevice() {
+        }
+    }
+}

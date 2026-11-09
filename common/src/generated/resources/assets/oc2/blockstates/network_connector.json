@@ -1,0 +1,266 @@
+{
+  "multipart": [
+    {
+      "apply": {
+        "model": "oc2:block/network_connector"
+      },
+      "when": {
+        "face": "floor",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator"
+      },
+      "when": {
+        "connected": "true",
+        "face": "floor",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "y": 90
+      },
+      "when": {
+        "face": "floor",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "y": 90
+      },
+      "when": {
+        "connected": "true",
+        "face": "floor",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "y": 180
+      },
+      "when": {
+        "face": "floor",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "y": 180
+      },
+      "when": {
+        "connected": "true",
+        "face": "floor",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "y": 270
+      },
+      "when": {
+        "face": "floor",
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "y": 270
+      },
+      "when": {
+        "connected": "true",
+        "face": "floor",
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 90
+      },
+      "when": {
+        "face": "wall",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 90
+      },
+      "when": {
+        "connected": "true",
+        "face": "wall",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 90,
+        "y": 90
+      },
+      "when": {
+        "face": "wall",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 90,
+        "y": 90
+      },
+      "when": {
+        "connected": "true",
+        "face": "wall",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 90,
+        "y": 180
+      },
+      "when": {
+        "face": "wall",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 90,
+        "y": 180
+      },
+      "when": {
+        "connected": "true",
+        "face": "wall",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 90,
+        "y": 270
+      },
+      "when": {
+        "face": "wall",
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 90,
+        "y": 270
+      },
+      "when": {
+        "connected": "true",
+        "face": "wall",
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 180,
+        "y": 180
+      },
+      "when": {
+        "face": "ceiling",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 180,
+        "y": 180
+      },
+      "when": {
+        "connected": "true",
+        "face": "ceiling",
+        "facing": "north"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 180,
+        "y": 270
+      },
+      "when": {
+        "face": "ceiling",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 180,
+        "y": 270
+      },
+      "when": {
+        "connected": "true",
+        "face": "ceiling",
+        "facing": "east"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 180
+      },
+      "when": {
+        "face": "ceiling",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 180
+      },
+      "when": {
+        "connected": "true",
+        "face": "ceiling",
+        "facing": "south"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector",
+        "x": 180,
+        "y": 90
+      },
+      "when": {
+        "face": "ceiling",
+        "facing": "west"
+      }
+    },
+    {
+      "apply": {
+        "model": "oc2:block/network_connector_indicator",
+        "x": 180,
+        "y": 90
+      },
+      "when": {
+        "connected": "true",
+        "face": "ceiling",
+        "facing": "west"
+      }
+    }
+  ]
+}

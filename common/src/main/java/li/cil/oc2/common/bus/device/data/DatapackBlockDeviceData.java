@@ -1,0 +1,61 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus.device.data;
+
+import li.cil.sedna.api.device.BlockDevice;
+import li.cil.sedna.device.block.ByteBufferBlockDevice;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.packs.resources.ResourceManager;
+import net.minecraft.world.item.DyeColor;
+
+import javax.annotation.Nullable;
+import java.io.IOException;
+import java.io.InputStream;
+
+public final class DatapackBlockDeviceData implements BlockDeviceDataResource, AutoCloseable {
+    private final Identifier location;
+    private final String name;
+    @Nullable
+    private final DyeColor color;
+    private final BlockDevice blockDevice;
+
+    public DatapackBlockDeviceData(final ResourceManager resourceManager, final Identifier location, final String name, @Nullable final DyeColor color) throws IOException {
+        this.location = location;
+        this.name = name;
+        this.color = color;
+        final InputStream stream = resourceManager.getResourceOrThrow(location).open();
+        this.blockDevice = ByteBufferBlockDevice.createFromStream(stream, true);
+    }
+
+    @Override
+    public Identifier getLocation() {
+        return location;
+    }
+
+    @Override
+    public void close() throws IOException {
+        blockDevice.close();
+    }
+
+    @Override
+    public BlockDevice getBlockDevice() {
+        return blockDevice;
+    }
+
+    @Override
+    public long getCapacity() {
+        return blockDevice.getCapacity();
+    }
+
+    @Override
+    public Component getDisplayName() {
+        return Component.literal(name);
+    }
+
+    @Nullable
+    @Override
+    public DyeColor getColor() {
+        return color;
+    }
+}

@@ -1,0 +1,49 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.gametest;
+
+import li.cil.oc2.gametest.fixture.RobotFixture;
+import net.minecraft.core.BlockPos;
+import net.minecraft.gametest.framework.GameTestAssertException;
+import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+
+import static li.cil.oc2.gametest.util.TestSupport.WORK_Y;
+
+public final class RobotCrushTests {
+    public static final BlockPos ROBOT_POS = new BlockPos(16, WORK_Y, 2);
+    public static final int ROBOT_CHECK_GRACE_PERIOD = 40;
+
+    // --------------------------------------------------------------------- //
+
+    public static void crushesAnOrdinaryBlock(final GameTestHelper helper) {
+        final BlockPos target = putBlockInsideTheRobot(helper, Blocks.DIRT);
+
+        helper.startSequence()
+            .thenExecuteAfter(ROBOT_CHECK_GRACE_PERIOD, () -> {
+                if (!helper.getLevel().getBlockState(target).isAir()) {
+                    throw new GameTestAssertException("the robot did not clear the dirt it was inside of");
+                }
+            })
+            .thenSucceed();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public static BlockPos putBlockInsideTheRobot(final GameTestHelper helper, final Block block) {
+        return putBlockInsideTheRobot(helper, block.defaultBlockState());
+    }
+
+    public static BlockPos putBlockInsideTheRobot(final GameTestHelper helper, final BlockState state) {
+        final BlockPos target = RobotFixture.place(helper, ROBOT_POS).blockPos();
+        helper.getLevel().setBlockAndUpdate(target, state);
+        return target;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private RobotCrushTests() {
+    }
+}

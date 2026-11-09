@@ -1,0 +1,249 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.vm;
+
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.DeviceType;
+import li.cil.oc2.api.bus.device.DeviceTypes;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.api.bus.device.vm.ArchitectureType;
+import li.cil.oc2.api.bus.device.vm.VMDevice;
+import li.cil.oc2.common.bus.AbstractDeviceBusElement;
+import li.cil.oc2.common.bus.AbstractItemDeviceBusElement;
+import li.cil.oc2.common.bus.device.SystemDevice;
+import li.cil.oc2.common.container.AbstractDeviceItemStackHandler;
+import li.cil.oc2.common.container.AbstractTypedDeviceItemStackHandler;
+import li.cil.oc2.common.container.CombinedItemHandler;
+import li.cil.oc2.common.inventory.DeferredNotifyItemHandler;
+import li.cil.oc2.common.inventory.ItemHandler;
+import li.cil.oc2.common.item.CpuItem;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.item.ItemStack;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import static java.util.Collections.singleton;
+import static li.cil.oc2.common.bus.device.DeviceTypeRegistry.key;
+
+public abstract class AbstractVMItemStackHandlers implements VMItemStackHandlers {
+    public record GroupDefinition(DeviceType deviceType, int count) {
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public final AbstractDeviceBusElement busElement = new VMBusElement();
+
+    // NB: linked hash map such that order of parameters in constructor is retained.
+    //     This is relevant when assigning default addresses for devices.
+    private final LinkedHashMap<DeviceType, AbstractDeviceItemStackHandler> itemHandlers = new LinkedHashMap<>();
+
+    public final ItemHandler combinedItemHandlers;
+
+    // --------------------------------------------------------------------- //
+
+    public AbstractVMItemStackHandlers(final GroupDefinition... groups) {
+        for (final GroupDefinition group : groups) {
+            itemHandlers.put(group.deviceType, new VMItemHandler(group.count, group.deviceType));
+        }
+
+        combinedItemHandlers = new CombinedItemHandler(itemHandlers.values().toArray(new DeferredNotifyItemHandler[0]));
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public Optional<ItemHandler> getItemHandler(final DeviceType deviceType) {
+        return Optional.ofNullable(itemHandlers.get(deviceType));
+    }
+
+    @Override
+    public boolean isEmpty() {
+        for (int slot = 0; slot < combinedItemHandlers.getSlots(); slot++) {
+            if (!combinedItemHandlers.getStackInSlot(slot).isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public Optional<ArchitectureType> getArchitectureType() {
+        return getItemHandler(DeviceTypes.CPU.get())
+            .filter(handler -> handler.getSlots() > 0)
+            .map(handler -> handler.getStackInSlot(0))
+            .filter(stack -> stack.getItem() instanceof CpuItem)
+            .map(stack -> ((CpuItem) stack.getItem()).getArchitectureType());
+    }
+
+    public Collection<Device> getDevices() {
+        final ArrayList<Device> devices = new ArrayList<>();
+        for (final AbstractDeviceItemStackHandler handler : itemHandlers.values()) {
+            devices.addAll(handler.getBusElement().getLocalDevices());
+        }
+        return devices;
+    }
+
+    public DeviceLocation getDeviceLocation(final VMDevice wrapper) {
+        int slot = 0;
+
+        for (final Map.Entry<DeviceType, AbstractDeviceItemStackHandler> entry : itemHandlers.entrySet()) {
+            final DeviceType deviceType = entry.getKey();
+            final AbstractDeviceItemStackHandler handler = entry.getValue();
+
+            for (int i = 0; i < handler.getSlots(); i++) {
+                if (handler.getBusElement().groupContains(i, wrapper)) {
+                    // Ahhh, such special casing, much wow. Honestly I don't expect this
+                    // special case to ever be needed for anything other than physical
+                    // memory, so it's fine. Prove me wrong.
+                    if (deviceType == DeviceTypes.MEMORY.get()) {
+                        return DeviceLocation.UNSPECIFIED;
+                    } else {
+                        return DeviceLocation.slot(slot);
+                    }
+                }
+
+                slot++;
+            }
+        }
+
+        return DeviceLocation.BUS;
+    }
+
+    @Override
+    public void exportDeviceDataToItemStacks() {
+        for (final AbstractDeviceItemStackHandler handler : itemHandlers.values()) {
+            handler.exportDeviceDataToItemStacks();
+        }
+    }
+
+    public void saveItems(final HolderLookup.Provider registries, final CompoundTag tag) {
+        itemHandlers.forEach((deviceType, handler) -> {
+            if (!handler.isEmpty()) {
+                tag.put(key(deviceType), handler.saveItems(registries));
+            }
+        });
+    }
+
+    public CompoundTag saveItems(final HolderLookup.Provider registries) {
+        final CompoundTag tag = new CompoundTag();
+        saveItems(registries, tag);
+        return tag;
+    }
+
+    public void loadItems(final HolderLookup.Provider registries, final CompoundTag tag) {
+        itemHandlers.forEach((deviceType, handler) ->
+            handler.loadItems(registries, tag.getCompoundOrEmpty(key(deviceType))));
+    }
+
+    public void saveDevices(final CompoundTag tag) {
+        itemHandlers.forEach((deviceType, handler) ->
+            tag.put(key(deviceType), handler.saveDevices()));
+    }
+
+    public CompoundTag saveDevices() {
+        final CompoundTag tag = new CompoundTag();
+        saveDevices(tag);
+        return tag;
+    }
+
+    public void loadDevices(final CompoundTag tag) {
+        itemHandlers.forEach((deviceType, handler) ->
+            handler.loadDevices(tag.getCompoundOrEmpty(key(deviceType))));
+    }
+
+    public void resetDevices() {
+        itemHandlers.values().forEach(handler -> handler.getBusElement().reset());
+    }
+
+    public void updateDevices() {
+        itemHandlers.values().forEach(AbstractDeviceItemStackHandler::updateDevices);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    protected abstract boolean isClientSide();
+
+    protected abstract ItemDeviceQuery makeQuery(final ItemStack stack);
+
+    protected void onChanged() {
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private final class VMItemHandler extends AbstractTypedDeviceItemStackHandler {
+        private final VMItemBusElement busElement;
+
+        public VMItemHandler(final int size, final DeviceType deviceType) {
+            super(size, deviceType);
+            this.busElement = new VMItemBusElement(getSlots());
+        }
+
+        @Override
+        public AbstractItemDeviceBusElement getBusElement() {
+            return busElement;
+        }
+
+        @Override
+        protected void onContentsChanged(final int slot) {
+            super.onContentsChanged(slot);
+            onChanged();
+        }
+    }
+
+    private final class VMItemBusElement extends AbstractItemDeviceBusElement {
+        public VMItemBusElement(final int groupCount) {
+            super(groupCount);
+        }
+
+        @Override
+        public void invalidateDevices() {
+            updateDevices();
+        }
+
+        @Override
+        protected ItemDeviceQuery makeQuery(final ItemStack stack) {
+            return AbstractVMItemStackHandlers.this.makeQuery(stack);
+        }
+
+        @Override
+        protected Set<ItemEntry> collectDevices(final ItemStack stack) {
+            return isClientSide() ? Set.of() : super.collectDevices(stack);
+        }
+    }
+
+    private final class VMBusElement extends AbstractDeviceBusElement {
+        // Sorts first in IODeviceRegistry, pinning SYSTEM to mid-level API device index 0.
+        private static final UUID SYSTEM_DEVICE_ID = new UUID(Long.MIN_VALUE, Long.MIN_VALUE);
+
+        private final Device systemDevice = new ObjectDevice(new SystemDevice());
+
+        @Override
+        public Optional<Collection<DeviceBusElement>> getNeighbors() {
+            return Optional.of(itemHandlers.values().stream()
+                .map(handler -> (DeviceBusElement) handler.getBusElement())
+                .collect(Collectors.toList()));
+        }
+
+        @Override
+        public Collection<Device> getLocalDevices() {
+            return singleton(systemDevice);
+        }
+
+        @Override
+        public Optional<UUID> getDeviceIdentifier(final Device device) {
+            if (device == systemDevice) {
+                return Optional.of(SYSTEM_DEVICE_ID);
+            }
+            return super.getDeviceIdentifier(device);
+        }
+    }
+}

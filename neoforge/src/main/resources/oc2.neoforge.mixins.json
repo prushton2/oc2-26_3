@@ -1,0 +1,12 @@
+{
+    "required": true,
+    "minVersion": "0.8",
+    "package": "li.cil.oc2.mixin.neoforge",
+    "compatibilityLevel": "JAVA_25",
+    "mixins": [
+        "WrenchItemMixin"
+    ],
+    "injectors": {
+        "defaultRequire": 1
+    }
+}

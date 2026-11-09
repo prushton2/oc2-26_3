@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": "oc2:circuit_board",
+    "C": "#c:ingots/copper",
+    "P": "minecraft:diamond_pickaxe",
+    "T": "oc2:transistor"
+  },
+  "pattern": [
+    "TPC",
+    " B "
+  ],
+  "result": {
+    "id": "oc2:block_operations_module"
+  }
+}

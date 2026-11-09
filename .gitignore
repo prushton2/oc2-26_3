@@ -1,0 +1,47 @@
+# Gradle
+.gradle/
+build/
+.kotlin/
+
+# Loom / Architectury / NeoForge run directories and logs
+run/
+runs/
+logs/
+*.log
+.architectury-transformer/
+
+# Java
+*.class
+hs_err_pid*.log
+replay_pid*.log
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Eclipse / VS Code Java (compiles into bin/ next to each project)
+.classpath
+.project
+.settings/
+.factorypath
+*.launch
+bin/
+# ...but bin/ directories inside sources are real content (e.g. common/src/main/scripts/bin)
+!**/src/**/bin/
+
+# VS Code
+.vscode/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
+
+# Seafile sync conflict copies
+*SFConflict*

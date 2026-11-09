@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "C": "#c:ingots/copper",
+    "R": "#c:dusts/redstone",
+    "T": "oc2:transistor"
+  },
+  "pattern": [
+    "TRT",
+    "RCR",
+    "TRT"
+  ],
+  "result": {
+    "id": "oc2:cpu_z80"
+  }
+}

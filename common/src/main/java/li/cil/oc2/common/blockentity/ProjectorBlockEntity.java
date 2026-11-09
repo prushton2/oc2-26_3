@@ -1,0 +1,413 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.blockentity;
+
+import li.cil.oc2.common.Config;
+import li.cil.oc2.common.block.FlippableOrientableBlock;
+import li.cil.oc2.common.block.FlippableOrientation;
+import li.cil.oc2.common.block.ProjectorBlock;
+import li.cil.oc2.common.bus.device.block.ProjectorDevice;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.energy.FixedEnergyHandler;
+import li.cil.oc2.common.network.Network;
+import li.cil.oc2.common.network.ProjectorLoadBalancer;
+import li.cil.oc2.common.network.message.ProjectorRequestFramebufferMessage;
+import li.cil.oc2.common.network.message.ProjectorStateMessage;
+import li.cil.oc2.jcodec.codecs.h264.H264Decoder;
+import li.cil.oc2.jcodec.codecs.h264.H264Encoder;
+import li.cil.oc2.jcodec.codecs.h264.encode.CQPRateControl;
+import li.cil.oc2.jcodec.common.model.ColorSpace;
+import li.cil.oc2.jcodec.common.model.Picture;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.SectionPos;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+
+import javax.annotation.Nullable;
+import java.nio.BufferOverflowException;
+import java.nio.ByteBuffer;
+import java.util.Arrays;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.zip.DataFormatException;
+import java.util.zip.Deflater;
+import java.util.zip.Inflater;
+
+public final class ProjectorBlockEntity extends ModBlockEntity implements TickableBlockEntity {
+    @FunctionalInterface
+    public interface FrameConsumer {
+        void processFrame(final Picture picture);
+    }
+
+    public interface FrameSupplier {
+        /**
+         * Gets and resets the keyframe flag, to be passed to {@link #encode(boolean)}.
+         * <p>
+         * Separate so this can run on the server thread whereas encoding runs on a worker thread.
+         *
+         * @return whether the next encode should be a keyframe.
+         */
+        boolean consumeRequiresKeyframe();
+
+        /**
+         * Encodes the frame to send.
+         *
+         * @param forceKeyframe whether the frame must be decodable on its own.
+         * @return the encoded frame, or {@code null} if there is nothing to send.
+         */
+        @Nullable
+        byte[] encode(boolean forceKeyframe);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public static final int MAX_FRAME_SIZE = 1024 * 1024;
+    public static final int MAX_RENDER_DISTANCE = 16;
+    public static final int MAX_WATCH_DISTANCE = 64; // Default max block entity render distance.
+    public static final int MAX_GOOD_RENDER_DISTANCE = 12;
+    public static final int MAX_WIDTH = MAX_GOOD_RENDER_DISTANCE + 1; // +1 To make it odd, so we can center.
+    public static final int MAX_HEIGHT = (MAX_GOOD_RENDER_DISTANCE * ProjectorDevice.HEIGHT / ProjectorDevice.WIDTH) + 1; // + 1 To match horizontal margin.
+
+    private static final String ENERGY_TAG_NAME = "energy";
+    private static final String IS_PROJECTING_TAG_NAME = "projecting";
+    private static final String HAS_ENERGY_TAG_NAME = "has_energy";
+
+    private static final int POWER_ON_DELAY_TICKS = 5;
+
+    private static final ExecutorService DECODER_WORKERS = Executors.newCachedThreadPool(r -> {
+        final Thread thread = new Thread(r);
+        thread.setDaemon(true);
+        thread.setName("Projector Frame Decoder");
+        return thread;
+    });
+
+    // --------------------------------------------------------------------- //
+
+    private final ProjectorDevice projectorDevice = new ProjectorDevice(this, this::handleMountedChanged);
+    private boolean isMounted;
+    private boolean hasEnergy;
+    private int ticksWithEnergy;
+    private final FixedEnergyHandler energy = new FixedEnergyHandler(Config.projectorEnergyStorage);
+    private final Picture picture = Picture.create(ProjectorDevice.WIDTH, ProjectorDevice.HEIGHT, ColorSpace.YUV420J);
+
+    // Video encoding.
+    private final H264Encoder encoder = new H264Encoder(new CQPRateControl(12));
+    private final ByteBuffer encoderBuffer = ByteBuffer.allocateDirect(MAX_FRAME_SIZE); // Re-used compression buffer.
+    private final ByteBuffer compressedBuffer = ByteBuffer.allocateDirect(MAX_FRAME_SIZE); // Re-used compression buffer.
+    private final Deflater deflater = new Deflater(Deflater.BEST_COMPRESSION); // Re-used, native memory.
+    private boolean needsIDR; // Whether we need to send a keyframe next.
+    private final FrameSupplierImpl frameSupplier = new FrameSupplierImpl(); // Limited interface for load balancer.
+
+    // Video decoding.
+    private final H264Decoder decoder = new H264Decoder();
+    @Nullable
+    private CompletableFuture<?> runningDecode; // Current decoding operation, if any, to avoid race conditions.
+    private final ByteBuffer decoderBuffer = ByteBuffer.allocateDirect(MAX_FRAME_SIZE); // Re-used decompression buffer.
+    private final Inflater inflater = new Inflater(); // Re-used, native memory.
+    @Nullable
+    private FrameConsumer frameConsumer; // Where to throw received frames.
+
+    private AABB renderBounds; // Maximum possible render bounds, assuming we project on furthest away surface.
+    private long lastKeepAliveSentAt;
+
+    // --------------------------------------------------------------------- //
+
+    public ProjectorBlockEntity(final BlockPos pos, final BlockState state) {
+        super(BlockEntities.PROJECTOR.get(), pos, state);
+
+        encoder.setKeyInterval(100);
+
+        updateRenderBounds();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    public boolean isProjecting() {
+        if (!isMounted || level == null) {
+            return false;
+        }
+
+        final Direction facing = getBlockState().getValue(FlippableOrientableBlock.ORIENTATION).getFacing();
+        final BlockPos neighborPos = getBlockPos().relative(facing);
+        final int neighborChunkX = SectionPos.blockToSectionCoord(neighborPos.getX());
+        final int neighborChunkZ = SectionPos.blockToSectionCoord(neighborPos.getZ());
+        if (!level.hasChunk(neighborChunkX, neighborChunkZ)) {
+            return false;
+        }
+
+        final BlockState neighborBlockState = level.getBlockState(neighborPos);
+        return !neighborBlockState.isSolidRender();
+    }
+
+    public boolean hasEnergy() {
+        return hasEnergy;
+    }
+
+    public void setRequiresKeyframe() {
+        needsIDR = true;
+    }
+
+    public void setFrameConsumer(@Nullable final FrameConsumer consumer) {
+        if (consumer == frameConsumer) {
+            return;
+        }
+        synchronized (picture) {
+            this.frameConsumer = consumer;
+            if (frameConsumer != null) {
+                frameConsumer.processFrame(picture);
+            }
+        }
+    }
+
+    public void onRendering() {
+        final long now = System.currentTimeMillis();
+        if (now - lastKeepAliveSentAt > 1000) {
+            lastKeepAliveSentAt = now;
+            Network.sendToServer(new ProjectorRequestFramebufferMessage(this));
+        }
+    }
+
+    @Override
+    public void serverTick() {
+        final BlockState state = getBlockState();
+        if (state.getValue(ProjectorBlock.LIT) != isMounted) {
+            level.setBlock(getBlockPos(), state.setValue(ProjectorBlock.LIT, isMounted), Block.UPDATE_CLIENTS);
+        }
+
+        if (!isMounted) {
+            return;
+        }
+
+        final boolean isPowered;
+        if (Config.projectorsUseEnergy()) {
+            if (energy.extractEnergy(Config.projectorEnergyPerTick, true) < Config.projectorEnergyPerTick) {
+                ticksWithEnergy = 0;
+            } else if (ticksWithEnergy < POWER_ON_DELAY_TICKS) {
+                ticksWithEnergy++;
+            }
+
+            isPowered = ticksWithEnergy >= POWER_ON_DELAY_TICKS;
+            if (isPowered) {
+                energy.extractEnergy(Config.projectorEnergyPerTick, false);
+            }
+        } else {
+            isPowered = true;
+        }
+        updateProjectorState(isMounted, isPowered);
+
+        if (!hasEnergy || (!projectorDevice.hasChanges() && !needsIDR)) {
+            return;
+        }
+
+        ProjectorLoadBalancer.offerFrame(this, frameSupplier);
+    }
+
+    @Override
+    public CompoundTag getUpdateTag(final HolderLookup.Provider registries) {
+        final CompoundTag tag = super.getUpdateTag(registries);
+
+        tag.putBoolean(IS_PROJECTING_TAG_NAME, isMounted);
+        tag.putBoolean(HAS_ENERGY_TAG_NAME, hasEnergy);
+
+        return tag;
+    }
+
+
+    @Override
+    protected void saveAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.saveAdditional(tag, registries);
+
+        tag.put(ENERGY_TAG_NAME, energy.serializeNBT());
+    }
+
+    @Override
+    protected void loadAdditional(final CompoundTag tag, final HolderLookup.Provider registries) {
+        super.loadAdditional(tag, registries);
+
+        energy.deserializeNBT(tag.getCompoundOrEmpty(ENERGY_TAG_NAME));
+
+        if (tag.contains(IS_PROJECTING_TAG_NAME)) {
+            isMounted = tag.getBooleanOr(IS_PROJECTING_TAG_NAME, false);
+        }
+        if (tag.contains(HAS_ENERGY_TAG_NAME)) {
+            hasEnergy = tag.getBooleanOr(HAS_ENERGY_TAG_NAME, false);
+        }
+    }
+
+    @Nullable
+    @Override
+    public AABB getExpandedRenderBoundingBox() {
+        return renderBounds;
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public void setBlockState(final BlockState state) {
+        super.setBlockState(state);
+
+        updateRenderBounds();
+    }
+
+    public void applyProjectorStateClient(final boolean isProjecting, final boolean hasEnergy) {
+        if (level == null || !level.isClientSide()) {
+            return;
+        }
+
+        this.isMounted = isProjecting;
+        this.hasEnergy = hasEnergy;
+    }
+
+    public void applyNextFrameClient(final byte[] frameData) {
+        if (level == null || !level.isClientSide() || !isValid()) {
+            return;
+        }
+
+        final CompletableFuture<?> lastDecode = runningDecode;
+        final CompletableFuture<?> previous = lastDecode != null
+            ? lastDecode.exceptionally(unused -> null)
+            : CompletableFuture.completedFuture(null);
+
+        runningDecode = previous.thenRunAsync(() -> {
+            try {
+                inflater.reset();
+                inflater.setInput(frameData);
+
+                decoderBuffer.clear();
+                inflater.inflate(decoderBuffer);
+                decoderBuffer.flip();
+
+                decoder.decodeFrame(decoderBuffer, picture.getData());
+
+                synchronized (picture) {
+                    if (frameConsumer != null) {
+                        frameConsumer.processFrame(picture);
+                    }
+                }
+            } catch (final DataFormatException ignored) {
+            }
+        }, DECODER_WORKERS);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    protected void onUnload(final boolean isDestroyed) {
+        super.onUnload(isDestroyed);
+
+        setFrameConsumer(null); // expected to stay null -> this will no longer be rendered.
+
+        final CompletableFuture<?> decode = runningDecode;
+        runningDecode = null; // will stay null because unloaded -> !isValid() in applyNextFrameClient.
+
+        // Await both in-flight codecs if necessary to not kill their native memory while in use.
+        final CompletableFuture<?> encode = ProjectorLoadBalancer.stop(this);
+        CompletableFuture.allOf(handled(decode), handled(encode))
+            .whenComplete((result, error) -> endCodecs());
+    }
+
+    private void endCodecs() {
+        deflater.end();
+        inflater.end();
+    }
+
+    @Override
+    protected void collectCapabilities(final CapabilityCollector collector, @Nullable final Direction direction) {
+        if (Config.projectorsUseEnergy()) {
+            collector.offer(Capabilities.ENERGY_STORAGE, energy);
+        }
+
+        if (direction == getBlockState().getValue(FlippableOrientableBlock.ORIENTATION).getFacing().getOpposite()) {
+            collector.offer(Capabilities.DEVICE, projectorDevice);
+        }
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void handleMountedChanged(final boolean value) {
+        updateProjectorState(value, hasEnergy);
+    }
+
+    private void updateProjectorState(final boolean isMounted, final boolean hasEnergy) {
+        if (isMounted == this.isMounted && hasEnergy == this.hasEnergy) {
+            return;
+        }
+
+        // We may get called from unmount() of our device, which can be triggered due to chunk unload or removal.
+        // Hence, we need to check the loaded state here, lest we ghost load the chunk, breaking everything.
+        if (isValid() && level != null && !level.isClientSide() && level.isLoaded(getBlockPos())) {
+            if (this.isMounted && !isMounted) {
+                Arrays.fill(picture.getPlaneData(0), (byte) -128);
+                Arrays.fill(picture.getPlaneData(1), (byte) 0);
+                Arrays.fill(picture.getPlaneData(2), (byte) 0);
+            }
+
+            this.isMounted = isMounted;
+            this.hasEnergy = hasEnergy;
+
+            Network.sendToClientsTrackingBlockEntity(new ProjectorStateMessage(this, isMounted, hasEnergy), this);
+        }
+    }
+
+    private static CompletableFuture<?> handled(@Nullable final CompletableFuture<?> future) {
+        return future == null ? CompletableFuture.completedFuture(null) : future.handle((result, error) -> null);
+    }
+
+    private final class FrameSupplierImpl implements FrameSupplier {
+        @Override
+        public boolean consumeRequiresKeyframe() {
+            final boolean result = needsIDR;
+            needsIDR = false;
+            return result;
+        }
+
+        @Override
+        @Nullable
+        public byte[] encode(final boolean forceKeyframe) {
+            final boolean hasChanges = projectorDevice.applyChanges(picture);
+            if (!hasChanges && !forceKeyframe) {
+                return null;
+            }
+
+            encoderBuffer.clear();
+            final ByteBuffer frameData;
+            try {
+                if (forceKeyframe) {
+                    frameData = encoder.encodeIDRFrame(picture, encoderBuffer);
+                } else {
+                    frameData = encoder.encodeFrame(picture, encoderBuffer).data();
+                }
+            } catch (final BufferOverflowException ignored) {
+                return null;
+            }
+
+            deflater.reset();
+            deflater.setInput(frameData);
+            deflater.finish();
+
+            compressedBuffer.clear();
+            deflater.deflate(compressedBuffer, Deflater.FULL_FLUSH);
+            compressedBuffer.flip();
+
+            final byte[] compressedFrameData = new byte[compressedBuffer.remaining()];
+            compressedBuffer.get(compressedFrameData);
+
+            return compressedFrameData;
+        }
+    }
+
+    private void updateRenderBounds() {
+        final FlippableOrientation orientation = getBlockState().getValue(FlippableOrientableBlock.ORIENTATION);
+        final double spread = MAX_RENDER_DISTANCE / (double) MAX_GOOD_RENDER_DISTANCE;
+        final Vec3 far = Vec3.atCenterOf(getBlockPos()).add(new Vec3(orientation.getFacing().step()).scale(MAX_RENDER_DISTANCE));
+        final Vec3 halfWidth = new Vec3(orientation.getRight().step()).scale((MAX_WIDTH - 1) / 2.0 * spread);
+        final Vec3 height = new Vec3(orientation.getUp().step()).scale((MAX_HEIGHT - 1) * spread);
+
+        renderBounds = new AABB(getBlockPos()).minmax(new AABB(far.subtract(halfWidth), far.add(halfWidth).add(height)));
+    }
+}

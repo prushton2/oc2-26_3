@@ -1,0 +1,623 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import dev.architectury.registry.registries.Registrar;
+import li.cil.oc2.api.API;
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.DeviceBusElement;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.ItemDevice;
+import li.cil.oc2.api.bus.device.object.Callback;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.provider.BlockDeviceProvider;
+import li.cil.oc2.api.bus.device.provider.BlockDeviceQuery;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceProvider;
+import li.cil.oc2.api.bus.device.provider.ItemDeviceQuery;
+import li.cil.oc2.api.bus.device.vm.ArchitectureType;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.bus.device.provider.Providers;
+import li.cil.oc2.common.capabilities.Capabilities;
+import li.cil.oc2.common.capabilities.CapabilityCache;
+import li.cil.oc2.common.capabilities.CapabilityType;
+import li.cil.oc2.common.util.LevelUtils;
+import li.cil.sedna.api.device.serial.SerialDevice;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.LevelAccessor;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.Mockito.*;
+
+public class BlockDeviceBusControllerTests {
+    private static final Identifier TEST_PROVIDER_REGISTRY_NAME = Identifier.fromNamespaceAndPath(API.MOD_ID, "test");
+
+    private MockedStatic<Capabilities> capabilitiesMock;
+    private MockedStatic<Providers> providersMock;
+    private MockedStatic<LevelUtils> levelUtilsMock;
+
+    private FakeLevel fakeLevel;
+    private ServerLevel level;
+
+    // --------------------------------------------------------------------- //
+
+    @BeforeEach
+    public void setupEach() {
+        capabilitiesMock = mockStatic(Capabilities.class);
+
+        capabilitiesMock.when(() -> Capabilities.listen(any(), any(), any())).thenReturn((Capabilities.InvalidationHandle) () -> {});
+        capabilitiesMock.when(() -> Capabilities.cache(any(), any(), any(), any())).then(a -> {
+            final LevelAccessor watchedLevel = a.getArgument(0);
+            final BlockPos watchedPos = a.getArgument(1);
+            final Direction watchedSide = a.getArgument(2);
+            final CapabilityType<Object> watchedType = a.getArgument(3);
+
+            final BlockEntity blockEntity = watchedLevel.getBlockEntity(watchedPos);
+            final Object value = blockEntity == null
+                ? null
+                : Capabilities.get(blockEntity, watchedType, watchedSide);
+
+            return value != null
+                ? Optional.of(new CapabilityCache<>(watchedLevel, watchedPos, watchedSide, watchedType, () -> value))
+                : Optional.empty();
+        });
+
+        providersMock = mockStatic(Providers.class);
+        final Registrar<BlockDeviceProvider> blockDeviceProviderRegistry = createBlockDeviceProviderRegistry();
+        providersMock.when(Providers::blockDeviceProviderRegistry).thenReturn(blockDeviceProviderRegistry);
+        final Registrar<ItemDeviceProvider> itemDeviceProviderRegistry = createItemDeviceProviderRegistry();
+        providersMock.when(Providers::itemDeviceProviderRegistry).thenReturn(itemDeviceProviderRegistry);
+        providersMock.when(() -> Providers.optionalKey((BlockDeviceProvider) any()))
+            .thenReturn(Optional.of(TEST_PROVIDER_REGISTRY_NAME.toString()));
+        providersMock.when(() -> Providers.optionalKey((ItemDeviceProvider) any()))
+            .thenReturn(Optional.of(TEST_PROVIDER_REGISTRY_NAME.toString()));
+
+        levelUtilsMock = mockStatic(LevelUtils.class);
+        levelUtilsMock.when(() -> LevelUtils.getBlockName(any(), any())).thenReturn("test_block");
+
+        fakeLevel = new FakeLevel();
+        level = fakeLevel.getLevel();
+    }
+
+    @AfterEach
+    public void teardownEach() {
+        capabilitiesMock.close();
+        providersMock.close();
+        levelUtilsMock.close();
+    }
+
+    @Test
+    public void busTouchingUnloadedChunkStaysIncomplete() {
+        final BlockPos posAtChunkEdge = new BlockPos(0, 0, 0);
+        final BlockDeviceBusController busController = new TestBusControllerBlockEntity(posAtChunkEdge).getBusController();
+
+        busController.scan();
+
+        assertEquals(CommonDeviceBusController.BusState.INCOMPLETE, busController.getState());
+    }
+
+    @Test
+    public void busNotTouchingUnloadedChunkCompletes() {
+        final BlockPos posInsideChunk = new BlockPos(8, 0, 8);
+        final BlockDeviceBusController busController = new TestBusControllerBlockEntity(posInsideChunk).getBusController();
+
+        busController.scan();
+
+        assertEquals(CommonDeviceBusController.BusState.READY, busController.getState());
+    }
+
+    @Test
+    public void busControllerIgnoresNonAccessibleBusElements() {
+        final BlockPos controllerPos = new BlockPos(8, 0, 8);
+        final TestBusControllerBlockEntity busController = new TestBusControllerBlockEntity(controllerPos);
+
+        final BlockPos elementPos = controllerPos.east();
+        final TestBusElementBlockEntity busElement = new TestBusElementBlockEntity(elementPos);
+        busElement.setSideEnabled(Direction.WEST, false);
+
+        busController.getBusController().scan();
+
+        assertEquals(CommonDeviceBusController.BusState.READY, busController.getBusController().getState());
+
+        assertFalse(busElement.getBusElement().getControllers().contains(busController.getBusController()));
+        assertFalse(busController.getBusController().getElements().contains(busElement.getBusElement()));
+    }
+
+    @Test
+    public void busControllerDetectsBusElements() {
+        final BlockPos controllerPos = new BlockPos(8, 0, 8);
+        final BlockDeviceBusController busController = new TestBusControllerBlockEntity(controllerPos).getBusController();
+
+        final BlockPos elementPos = controllerPos.east();
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+        final DeviceBusElement busElement = busElementInfo.getBusElement();
+
+        busController.scan();
+
+        assertTrue(busElement.getControllers().contains(busController));
+        assertTrue(busController.getElements().contains(busElement));
+    }
+
+    @Test
+    public void unloadedDeviceIsRemovedFromElement() {
+        final BlockPos elementPos = new BlockPos(0, 0, 8);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+        assertTrue(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), false);
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+        assertFalse(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+    }
+
+    @Test
+    public void deviceStateSurvivesChunkCycleWithoutController() {
+        final BlockPos elementPos = new BlockPos(8, 0, 8);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+        final TestBlockDeviceBusElement busElement = busElementInfo.getBusElement();
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        final DeviceBusController controller = busElementInfo.attachController();
+        busElement.updateDevicesForNeighbor(Direction.WEST);
+        assertTrue(busElement.getLocalDevices().contains(objectDevice));
+
+        busElement.removeController(controller);
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), false);
+        busElement.updateDevicesForNeighbor(Direction.WEST);
+
+        verify(objectDevice, times(1)).serializeNBT();
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), true);
+        final TestDeviceBlockEntity reloadedDeviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+        final ObjectDevice reloadedObjectDevice = spy(reloadedDeviceBlockEntity.getObjectDevice());
+        reloadedDeviceBlockEntity.setObjectDevice(reloadedObjectDevice);
+
+        busElementInfo.attachController();
+
+        assertTrue(busElement.getLocalDevices().contains(reloadedObjectDevice));
+        verify(reloadedObjectDevice, times(1)).deserializeNBT(any());
+    }
+
+    @Test
+    public void equalDeviceKeepsExistingInstance() {
+        final BlockPos elementPos = new BlockPos(0, 0, 0);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+        final TestBlockDeviceBusElement busElement = busElementInfo.getBusElement();
+
+        final BlockPos devicePos = elementPos.east();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        busElementInfo.attachController();
+
+        busElement.updateDevicesForNeighbor(Direction.EAST);
+
+        assertTrue(busElement.getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+
+        final ObjectDevice equalDevice = new ObjectDevice(deviceBlockEntity.getTestDevice());
+        deviceBlockEntity.setObjectDevice(equalDevice);
+
+        busElement.updateDevicesForNeighbor(Direction.EAST);
+
+        assertTrue(busElement.getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertNotSame(busElement.getLocalDevices().stream().findFirst().orElseThrow(), equalDevice);
+    }
+
+    @Test
+    public void deviceIsUnmountedAndSerializedWhenItsChunkUnloads() {
+        final BlockPos controllerPos = new BlockPos(1, 0, 8);
+        final BlockDeviceBusController busController = new TestBusControllerBlockEntity(controllerPos).getBusController();
+
+        final BlockPos elementPos = controllerPos.west();
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+        capabilitiesMock.when(() -> Capabilities.get(eq(level), eq(elementPos), eq(Capabilities.DEVICE_BUS_ELEMENT), any()))
+            .thenAnswer(a -> busElementInfo.getBusElement());
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), false);
+        busController.scheduleBusScan();
+
+        final RPCDeviceBusAdapter rpcDeviceBusAdapter = new RPCDeviceBusAdapter(mock(SerialDevice.class), mock(SerialDevice.class), mock(SerialDevice.class), amount -> true);
+        busController.onAfterDeviceScan.add(() -> rpcDeviceBusAdapter.rebuild(busController));
+
+        busController.scan();
+
+        assertEquals(CommonDeviceBusController.BusState.INCOMPLETE, busController.getState());
+
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertFalse(busController.getDevices().contains(objectDevice));
+
+        assertLifecycle(objectDevice, 0, 0, 0, 0, 0);
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), true);
+        busController.scheduleBusScan();
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        busController.scan();
+        assertEquals(CommonDeviceBusController.BusState.READY, busController.getState());
+
+        assertTrue(busController.getDevices().contains(objectDevice));
+
+        rpcDeviceBusAdapter.mountDevices();
+
+        assertLifecycle(objectDevice, 1, 0, 0, 0, 0);
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), false);
+        busController.scheduleBusScan();
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        busController.scan();
+        assertEquals(CommonDeviceBusController.BusState.INCOMPLETE, busController.getState());
+
+        assertFalse(busController.getDevices().contains(objectDevice));
+
+        assertLifecycle(objectDevice, 1, 1, 0, 1, 0);
+    }
+
+    @Test
+    public void dataDroppedForDeviceRemovedWhileElementUnloaded() {
+        final BlockPos elementPos = new BlockPos(0, 0, 8);
+        TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertTrue(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertLifecycle(objectDevice, 0, 0, 0, 0, 0);
+
+        final CompoundTag data = busElementInfo.getBusElement().save();
+        verify(objectDevice, times(1)).serializeNBT();
+        assertTrue(westGroupData(data).contains(TEST_PROVIDER_REGISTRY_NAME.toString()));
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(elementPos), false);
+        fakeLevel.removeBlockEntity(elementPos);
+
+        fakeLevel.removeBlockEntity(devicePos);
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(elementPos), true);
+        busElementInfo = new TestBusElementBlockEntity(elementPos);
+        busElementInfo.getBusElement().load(data);
+
+        busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertTrue(westGroupData(busElementInfo.getBusElement().save()).isEmpty());
+    }
+
+    @Test
+    public void dataDroppedWithElementRemovedWhileDeviceUnloaded() {
+        final BlockPos elementPos = new BlockPos(0, 0, 8);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        final DeviceBusController controller = busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertTrue(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertLifecycle(objectDevice, 0, 0, 0, 0, 0);
+
+        busElementInfo.getBusElement().removeController(controller);
+
+        fakeLevel.setChunkLoaded(ChunkPos.containing(devicePos), false);
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+        assertFalse(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertLifecycle(objectDevice, 0, 0, 0, 1, 0);
+
+        assertTrue(westGroupData(busElementInfo.getBusElement().save()).contains(TEST_PROVIDER_REGISTRY_NAME.toString()));
+
+        fakeLevel.removeBlockEntity(elementPos);
+        busElementInfo.getBusElement().setRemoved();
+
+        assertTrue(westGroupData(busElementInfo.getBusElement().save()).isEmpty());
+    }
+
+    @Test
+    public void deviceIsDisposedWhenElementIsRemoved() {
+        final BlockPos elementPos = new BlockPos(8, 0, 8);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        final DeviceBusController controller = busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertTrue(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertLifecycle(objectDevice, 0, 0, 0, 0, 0);
+
+        busElementInfo.getBusElement().removeController(controller);
+
+        fakeLevel.removeBlockEntity(elementPos);
+        busElementInfo.getBusElement().setRemoved();
+
+        verify(objectDevice, times(1)).dispose();
+    }
+
+    @Test
+    public void deviceIsDisposedWhenDeviceIsRemoved() {
+        final BlockPos elementPos = new BlockPos(8, 0, 8);
+        final TestBusElementBlockEntity busElementInfo = new TestBusElementBlockEntity(elementPos);
+
+        final BlockPos devicePos = elementPos.west();
+        final TestDeviceBlockEntity deviceBlockEntity = new TestDeviceBlockEntity(devicePos);
+
+        final ObjectDevice objectDevice = spy(deviceBlockEntity.getObjectDevice());
+        deviceBlockEntity.setObjectDevice(objectDevice);
+
+        final DeviceBusController controller = busElementInfo.attachController();
+
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        assertTrue(busElementInfo.getBusElement().getLocalDevices().contains(deviceBlockEntity.getObjectDevice()));
+        assertLifecycle(objectDevice, 0, 0, 0, 0, 0);
+
+        busElementInfo.getBusElement().removeController(controller);
+
+        fakeLevel.removeBlockEntity(devicePos);
+        busElementInfo.getBusElement().updateDevicesForNeighbor(Direction.WEST);
+
+        verify(objectDevice, never()).dispose();
+
+        busElementInfo.attachController();
+
+        verify(objectDevice, times(1)).dispose();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static CompoundTag westGroupData(final CompoundTag busElementData) {
+        return busElementData.getListOrEmpty("groups")
+            .getCompoundOrEmpty(Direction.WEST.get3DDataValue())
+            .getCompoundOrEmpty("groupData");
+    }
+
+    private static void assertLifecycle(final ObjectDevice device, final int mounts, final int unmounts,
+                                        final int disposes, final int serializes, final int deserializes) {
+        verify(device, times(mounts)).mount(any());
+        verify(device, times(unmounts)).unmount(any());
+        verify(device, times(disposes)).dispose();
+        verify(device, times(serializes)).serializeNBT();
+        verify(device, times(deserializes)).deserializeNBT(any());
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Registrar<BlockDeviceProvider> createBlockDeviceProviderRegistry() {
+        final Registrar<BlockDeviceProvider> registry = mock(Registrar.class);
+
+        final Map<Identifier, BlockDeviceProvider> blockDeviceProviders = new HashMap<>();
+        blockDeviceProviders.put(TEST_PROVIDER_REGISTRY_NAME, new TestBlockDeviceProvider());
+
+        when(registry.iterator()).then(a -> blockDeviceProviders.values().iterator());
+        when(registry.getId(notNull())).thenReturn(TEST_PROVIDER_REGISTRY_NAME);
+
+        return registry;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Registrar<ItemDeviceProvider> createItemDeviceProviderRegistry() {
+        final Registrar<ItemDeviceProvider> registry = mock(Registrar.class);
+
+        final Map<Identifier, ItemDeviceProvider> itemDeviceProviders = new HashMap<>();
+        itemDeviceProviders.put(TEST_PROVIDER_REGISTRY_NAME, new TestItemDeviceProvider());
+
+        when(registry.iterator()).then(a -> itemDeviceProviders.values().iterator());
+        when(registry.getId(notNull())).thenReturn(TEST_PROVIDER_REGISTRY_NAME);
+
+        return registry;
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private static final class FakeLevel {
+        private final ServerLevel level = mock(ServerLevel.class);
+        private final HashMap<BlockPos, BlockEntity> blockEntities = new HashMap<>();
+        private final HashSet<ChunkPos> loadedChunks = new HashSet<>();
+
+        public FakeLevel() {
+            when(level.getBlockEntity(any())).then(a -> blockEntities.get(a.<BlockPos>getArgument(0)));
+
+            when(level.hasChunk(anyInt(), anyInt())).then(a -> {
+                final int chunkX = a.getArgument(0);
+                final int chunkZ = a.getArgument(1);
+                return loadedChunks.contains(new ChunkPos(chunkX, chunkZ));
+            });
+        }
+
+        public ServerLevel getLevel() {
+            return level;
+        }
+
+        public void addBlockEntity(final BlockEntity blockEntity) {
+            blockEntities.put(blockEntity.getBlockPos(), blockEntity);
+        }
+
+        public void removeBlockEntity(final BlockPos pos) {
+            blockEntities.remove(pos);
+        }
+
+        public void setChunkLoaded(final ChunkPos chunkPos, final boolean loaded) {
+            if (loaded) {
+                loadedChunks.add(chunkPos);
+            } else {
+                loadedChunks.remove(chunkPos);
+            }
+        }
+    }
+
+    private class TestBlockEntity {
+        private final BlockEntity blockEntity;
+
+        public TestBlockEntity(final BlockPos pos) {
+            blockEntity = mock(BlockEntity.class);
+            when(blockEntity.getBlockPos()).thenReturn(pos);
+            fakeLevel.addBlockEntity(blockEntity);
+            fakeLevel.setChunkLoaded(ChunkPos.containing(pos), true);
+        }
+
+        public BlockEntity getBlockEntity() {
+            return blockEntity;
+        }
+    }
+
+    private class TestBusElementBlockEntity extends TestBlockEntity {
+        private final TestBlockDeviceBusElement busElement;
+        private final boolean[] enabledSides = new boolean[Constants.BLOCK_FACE_COUNT];
+
+        public TestBusElementBlockEntity(final BlockPos pos) {
+            super(pos);
+            busElement = spy(new TestBlockDeviceBusElement(level, pos));
+            capabilitiesMock.when(() -> Capabilities.get(eq(level), eq(pos), eq(Capabilities.DEVICE_BUS_ELEMENT), any())).then(a -> {
+                final Direction side = a.getArgument(3);
+                return side != null && enabledSides[side.get3DDataValue()] ? busElement : null;
+            });
+            Arrays.fill(enabledSides, true);
+        }
+
+        public TestBlockDeviceBusElement getBusElement() {
+            return busElement;
+        }
+
+        public DeviceBusController attachController() {
+            final DeviceBusController controller = mock(DeviceBusController.class);
+            when(controller.getArchitectureType()).thenReturn(Optional.of(ArchitectureType.RISCV));
+            busElement.addController(controller);
+            return controller;
+        }
+
+        public void setSideEnabled(final Direction side, final boolean value) {
+            enabledSides[side.get3DDataValue()] = value;
+        }
+    }
+
+    private class TestBusControllerBlockEntity extends TestBusElementBlockEntity {
+        private final BlockDeviceBusController busController;
+
+        public TestBusControllerBlockEntity(final BlockPos pos) {
+            super(pos);
+            busController = new BlockDeviceBusController(getBusElement(), () -> 0, getBlockEntity(), () -> Optional.of(ArchitectureType.RISCV));
+        }
+
+        public BlockDeviceBusController getBusController() {
+            return busController;
+        }
+    }
+
+    private class TestDeviceBlockEntity extends TestBlockEntity {
+        private final TestDevice testDevice;
+        private ObjectDevice objectDevice;
+
+        public TestDeviceBlockEntity(final BlockPos pos) {
+            super(pos);
+            testDevice = new TestDevice();
+            objectDevice = new ObjectDevice(testDevice);
+            capabilitiesMock.when(() -> Capabilities.get(eq(getBlockEntity()), eq(Capabilities.DEVICE), any()))
+                .thenAnswer(a -> objectDevice);
+        }
+
+        public TestDevice getTestDevice() {
+            return testDevice;
+        }
+
+        public ObjectDevice getObjectDevice() {
+            return objectDevice;
+        }
+
+        public void setObjectDevice(final ObjectDevice device) {
+            this.objectDevice = device;
+        }
+    }
+
+    private static final class TestBlockDeviceBusElement extends AbstractBlockDeviceBusElement {
+        private final LevelAccessor level;
+        private final BlockPos blockPos;
+
+        public TestBlockDeviceBusElement(final LevelAccessor level, final BlockPos blockPos) {
+            this.level = level;
+            this.blockPos = blockPos;
+        }
+
+        @Override
+        public LevelAccessor getLevel() {
+            return level;
+        }
+
+        @Override
+        public BlockPos getPosition() {
+            return blockPos;
+        }
+    }
+
+    private static class TestBlockDeviceProvider implements BlockDeviceProvider {
+        @Override
+        public Optional<Device> getDevice(final BlockDeviceQuery query) {
+            final LevelAccessor level = query.getLevel();
+            final BlockEntity blockEntity = level.getBlockEntity(query.getQueryPosition());
+            if (blockEntity != null) {
+                final Device device = Capabilities.get(blockEntity, Capabilities.DEVICE, null);
+                return device != null ? Optional.of(device) : Optional.empty();
+            }
+            return Optional.empty();
+        }
+    }
+
+    private static class TestItemDeviceProvider implements ItemDeviceProvider {
+        @Override
+        public Optional<ItemDevice> getDevice(final ItemDeviceQuery query) {
+            return Optional.empty();
+        }
+    }
+
+    public static class TestDevice {
+        @Callback
+        public int test() {
+            return 42;
+        }
+    }
+}

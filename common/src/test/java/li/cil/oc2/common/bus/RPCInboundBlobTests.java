@@ -1,0 +1,374 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.object.Callback;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.object.Parameter;
+import li.cil.oc2.api.bus.device.rpc.RPCDevice;
+import li.cil.oc2.common.Constants;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public final class RPCInboundBlobTests {
+    private static final byte[] PAYLOAD = "the quick brown fox".getBytes(StandardCharsets.UTF_8);
+    private static final long CHECKSUM = 2445345482L;
+
+    private TestSerialDevice serialDevice;
+    private TestSerialDevice blobDevice;
+    private TestSerialDevice eventDevice;
+    private RPCDeviceBusAdapter adapter;
+    private UUID deviceId;
+    private BlobSink sink;
+    private DeviceBusController busController;
+
+    @BeforeEach
+    public void setupEach() {
+        serialDevice = new TestSerialDevice();
+        blobDevice = new TestSerialDevice();
+        eventDevice = new TestSerialDevice();
+        adapter = new RPCDeviceBusAdapter(serialDevice, blobDevice, eventDevice, amount -> true);
+
+        sink = new BlobSink();
+        final RPCDevice device = new ObjectDevice(sink, "blobs");
+        deviceId = UUID.randomUUID();
+        final Set<Device> devices = new HashSet<>();
+        devices.add(device);
+        final Map<Device, Set<UUID>> identifiers = new HashMap<>();
+        identifiers.put(device, Set.of(deviceId));
+
+        busController = mock(DeviceBusController.class);
+        when(busController.getDevices()).thenReturn(devices);
+        when(busController.getDeviceIdentifiers(any()))
+            .then(invocation -> identifiers.get(invocation.getArgument(0)));
+        adapter.rebuild(busController);
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Test
+    public void payloadReachesTheCallback() {
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+
+        assertArrayEquals(PAYLOAD, sink.received, "the callback did not get the payload");
+        assertEquals(1, sink.calls);
+        assertEquals("result", serialDevice.readJsonAsVM().get("type").getAsString());
+    }
+
+    @Test
+    public void corruptedPayloadIsRefusedAndTheChannelKeepsWorking() {
+        final byte[] corrupted = PAYLOAD.clone();
+        corrupted[3] ^= 0x01;
+
+        blobDevice.putRawAsVM(corrupted);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+
+        assertNull(sink.received, "a corrupted payload must not reach the callback");
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_CORRUPT, serialDevice.readJsonAsVM().get("data").getAsString());
+
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+        assertArrayEquals(PAYLOAD, sink.received);
+    }
+
+    @Test
+    public void implausibleLengthIsRefused() {
+        serialDevice.putAsVM(invocation(Integer.MAX_VALUE, 0));
+        adapter.step(0);
+
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_MISMATCH, serialDevice.readJsonAsVM().get("data").getAsString());
+        assertNull(sink.received);
+    }
+
+    @Test
+    public void payloadHandedOverAcrossSeveralStepsBeforeTheMessage() {
+        blobDevice.putRawAsVM(new byte[]{PAYLOAD[0], PAYLOAD[1]});
+        adapter.step(0);
+
+        final byte[] rest = new byte[PAYLOAD.length - 2];
+        System.arraycopy(PAYLOAD, 2, rest, 0, rest.length);
+        blobDevice.putRawAsVM(rest);
+        adapter.step(0);
+
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+
+        assertArrayEquals(PAYLOAD, sink.received);
+        assertEquals("result", serialDevice.readJsonAsVM().get("type").getAsString());
+    }
+
+    @Test
+    public void underSentPayloadDoesNotWedgeTheBus() {
+        blobDevice.putRawAsVM(new byte[]{PAYLOAD[0]});
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+
+        assertNull(sink.received);
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_MISMATCH, serialDevice.readJsonAsVM().get("data").getAsString());
+
+        serialDevice.putAsVM("{\"type\":\"list\"}");
+        adapter.step(0);
+        assertEquals("list", serialDevice.readJsonAsVM().get("type").getAsString(), "the bus stopped answering");
+    }
+
+    @Test
+    public void overSentPayloadIsRefusedAndTheChannelRecovers() {
+        final byte[] tooMuch = new byte[PAYLOAD.length + 3];
+        System.arraycopy(PAYLOAD, 0, tooMuch, 0, PAYLOAD.length);
+        blobDevice.putRawAsVM(tooMuch);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+
+        assertNull(sink.received);
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_MISMATCH, serialDevice.readJsonAsVM().get("data").getAsString());
+
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+        assertArrayEquals(PAYLOAD, sink.received, "the channel did not recover");
+    }
+
+    @Test
+    public void payloadOnANonInvocationIsRefused() {
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM("{\"type\":\"list\",\"blobs\":[{\"length\":" + PAYLOAD.length
+            + ",\"checksum\":" + CHECKSUM + "}]}");
+        adapter.step(0);
+
+        assertEquals(RPCDeviceBusAdapter.ERROR_MALFORMED_MESSAGE, serialDevice.readJsonAsVM().get("data").getAsString());
+    }
+
+    @Test
+    public void zeroLengthPayloadIsAccepted() {
+        serialDevice.putAsVM(invocation(0, 0));
+        adapter.step(0);
+
+        assertNotNull(sink.received);
+        assertEquals(0, sink.received.length);
+    }
+
+    @Test
+    public void twoPayloadsReachTwoParameters() {
+        final byte[] second = {9, 8, 7};
+        blobDevice.putRawAsVM(PAYLOAD);
+        blobDevice.putRawAsVM(second);
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"blobs\":[{\"length\":" + PAYLOAD.length
+            + ",\"checksum\":" + CHECKSUM + "},{\"length\":3,\"checksum\":" + RPCPayloadChannel.checksum(second)
+            + "}],\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeTwo\",\"parameters\":[{\"$blob\":0},{\"$blob\":1}]}}");
+        adapter.step(0);
+
+        assertEquals("result", serialDevice.readJsonAsVM().get("type").getAsString());
+        assertArrayEquals(PAYLOAD, sink.received);
+        assertArrayEquals(second, sink.receivedSecond);
+    }
+
+    @Test
+    public void onePayloadMayReachTwoParameters() {
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"blobs\":[{\"length\":" + PAYLOAD.length
+            + ",\"checksum\":" + CHECKSUM + "}],\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeTwo\",\"parameters\":[{\"$blob\":0},{\"$blob\":0}]}}");
+        adapter.step(0);
+
+        assertEquals("result", serialDevice.readJsonAsVM().get("type").getAsString());
+        assertArrayEquals(PAYLOAD, sink.received);
+        assertArrayEquals(PAYLOAD, sink.receivedSecond);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "-1", "0.5", "true", "\"0\""})
+    public void invalidPayloadIndexIsRefused(final String index) {
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"blobs\":[{\"length\":" + PAYLOAD.length
+            + ",\"checksum\":" + CHECKSUM + "}],\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeBlob\",\"parameters\":[{\"$blob\":" + index + "}]}}");
+        adapter.step(0);
+
+        assertNull(sink.received);
+        assertEquals(RPCDeviceBusAdapter.ERROR_INVALID_PARAMETER_SIGNATURE,
+            serialDevice.readJsonAsVM().get("data").getAsString());
+    }
+
+    @Test
+    public void binaryParameterOnASynchronizedCallbackIsRefusedClearly() {
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"blobs\":[{\"length\":" + PAYLOAD.length
+            + ",\"checksum\":" + CHECKSUM + "}],\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeSynchronized\",\"parameters\":[{\"$blob\":0}]}}");
+        adapter.step(0);
+
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_NEEDS_UNSYNCHRONIZED,
+            serialDevice.readJsonAsVM().get("data").getAsString(),
+            "the payload is gone by the time a synchronized call runs, so say so");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"[{\"checksum\":0}]", "[{\"length\":\"x\",\"checksum\":0}]", "[5]", "5"})
+    public void malformedPayloadReferenceIsRefused(final String blobs) {
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"blobs\":" + blobs
+            + ",\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeBlob\",\"parameters\":[{\"$blob\":0}]}}");
+        assertDoesNotThrow(() -> adapter.step(0), "blob reference escaped as an exception");
+        assertNull(sink.received, "blob reference was accepted");
+        assertEquals("error", serialDevice.readJsonAsVM().get("type").getAsString(),
+            "blob reference got no reply, so a guest would wait forever");
+    }
+
+    @Test
+    public void inlineByteArrayParameterIsRefused() {
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeBlob\",\"parameters\":[[1,2,3]]}}");
+        adapter.step(0);
+
+        assertNull(sink.received);
+        assertEquals("error", serialDevice.readJsonAsVM().get("type").getAsString());
+    }
+
+    @Test
+    public void markerWithNoPayloadIsRefused() {
+        serialDevice.putAsVM("{\"type\":\"invoke\",\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeBlob\",\"parameters\":[{\"$blob\":0}]}}");
+        adapter.step(0);
+
+        assertNull(sink.received, "a marker without a payload must not reach the callback");
+        assertEquals("error", serialDevice.readJsonAsVM().get("type").getAsString());
+    }
+
+    @Test
+    public void resetAbandonsAPartiallyReceivedPayload() {
+        blobDevice.putRawAsVM(new byte[]{PAYLOAD[0]});
+        adapter.step(0);
+
+        adapter.reset();
+
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+        assertArrayEquals(PAYLOAD, sink.received);
+    }
+
+    @Test
+    public void payloadLargerThanTheChannelStillGetsThrough() {
+        final byte[] large = new byte[4096];
+        for (int i = 0; i < large.length; i++) {
+            large[i] = (byte) (i * 31 + 7);
+        }
+
+        serialDevice = new TestSerialDevice();
+        blobDevice = new TestSerialDevice(Integer.MAX_VALUE, 64);
+        adapter = new RPCDeviceBusAdapter(serialDevice, blobDevice, eventDevice, amount -> true);
+        adapter.rebuild(busController);
+
+        int offered = 0;
+        for (int i = 0; i < 1000 && offered < large.length; i++) {
+            offered = blobDevice.offerRawAsVM(large, offered);
+            adapter.step(0);
+        }
+        assertEquals(large.length, offered, "the guest never got the whole payload out");
+
+        serialDevice.putAsVM(invocation(large.length, RPCPayloadChannel.checksum(large)));
+        adapter.step(0);
+
+        assertArrayEquals(large, sink.received);
+    }
+
+    @Test
+    public void abandonedPayloadBytesDoNotPoisonTheNextTransfer() {
+        blobDevice.putRawAsVM("stray bytes nobody claimed".getBytes(StandardCharsets.UTF_8));
+
+        serialDevice.putAsVM("{\"type\":\"list\"}");
+        adapter.step(0);
+        assertEquals("list", serialDevice.readJsonAsVM().get("type").getAsString());
+
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+        assertArrayEquals(PAYLOAD, sink.received, "stale bytes broke the next transfer");
+    }
+
+    @Test
+    public void payloadPastTheCapIsRefusedAndTheChannelRecovers() {
+        final byte[] tooMuch = new byte[Constants.RPC_MAX_PAYLOAD_SIZE + 1];
+        blobDevice.putRawAsVM(tooMuch);
+        adapter.step(0);
+
+        assertEquals(-1, blobDevice.read(), "the host must drain even what it cannot keep");
+
+        serialDevice.putAsVM(invocation(0, 0));
+        adapter.step(0);
+        assertNull(sink.received, "an overflowed transfer must not pass as an empty one");
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_MISMATCH, serialDevice.readJsonAsVM().get("data").getAsString());
+
+        blobDevice.putRawAsVM(PAYLOAD);
+        serialDevice.putAsVM(invocation(PAYLOAD.length, CHECKSUM));
+        adapter.step(0);
+        assertArrayEquals(PAYLOAD, sink.received, "the channel did not recover after an overflow");
+    }
+
+    @Test
+    public void payloadThatExactlyFillsTheChannelIsAccepted() {
+        final byte[] exact = new byte[Constants.RPC_MAX_PAYLOAD_SIZE];
+        for (int i = 0; i < exact.length; i++) {
+            exact[i] = (byte) (i * 31 + 7);
+        }
+
+        blobDevice.putRawAsVM(exact);
+        serialDevice.putAsVM(invocation(exact.length, RPCPayloadChannel.checksum(exact)));
+        adapter.step(0);
+
+        assertArrayEquals(exact, sink.received, "a payload that fits exactly is not an oversized one");
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private String invocation(final int length, final long checksum) {
+        return "{\"type\":\"invoke\",\"blobs\":[{\"length\":" + length + ",\"checksum\":" + checksum + "}],"
+            + "\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"writeBlob\",\"parameters\":[{\"$blob\":0}]}}";
+    }
+
+    public static final class BlobSink {
+        public byte[] received;
+        public byte[] receivedSecond;
+        public int calls;
+
+        @Callback(synchronize = false)
+        public int writeBlob(@Parameter("data") final byte[] data) {
+            received = data;
+            calls++;
+            return data.length;
+        }
+
+        @Callback(synchronize = false)
+        public int writeTwo(@Parameter("a") final byte[] a, @Parameter("b") final byte[] b) {
+            received = a;
+            receivedSecond = b;
+            calls++;
+            return a.length + b.length;
+        }
+
+        @Callback
+        public int writeSynchronized(@Parameter("data") final byte[] data) {
+            received = data;
+            calls++;
+            return data.length;
+        }
+    }
+}

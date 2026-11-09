@@ -1,0 +1,286 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.bus;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.device.Device;
+import li.cil.oc2.api.bus.device.object.Callback;
+import li.cil.oc2.api.bus.device.object.ObjectDevice;
+import li.cil.oc2.api.bus.device.rpc.RPCDevice;
+import li.cil.oc2.common.Constants;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+public final class RPCBlobChannelTests {
+    private static final byte[] PAYLOAD = "the quick brown fox".getBytes(StandardCharsets.UTF_8);
+
+    private TestSerialDevice serialDevice;
+    private TestSerialDevice blobDevice;
+    private TestSerialDevice eventDevice;
+    private RPCDeviceBusAdapter adapter;
+    private UUID deviceId;
+
+    @BeforeEach
+    public void setupEach() {
+        setUpWith(new TestSerialDevice(), new TestSerialDevice());
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Test
+    public void payloadGoesOutOnTheBlobPortAndIsDescribedByTheMessage() {
+        final JsonObject reply = invoke("readBlob");
+
+        final JsonArray blobs = reply.getAsJsonArray("blobs");
+        assertNotNull(blobs, "the message must describe the payload: " + reply);
+        assertEquals(1, blobs.size());
+        final JsonObject blob = blobs.get(0).getAsJsonObject();
+        assertEquals(PAYLOAD.length, blob.get("length").getAsInt());
+        assertEquals(RPCPayloadChannel.checksum(PAYLOAD), blob.get("checksum").getAsLong());
+
+        assertEquals(0, reply.getAsJsonObject("data").get("$blob").getAsInt(),
+            "the data should carry only a marker");
+        assertArrayEquals(PAYLOAD, blobDevice.drainAsVM(), "the payload goes out on the blob port");
+    }
+
+    @Test
+    public void replyStaysSmallHoweverBigThePayloadIs() {
+        final JsonObject large = invoke("readLarge");
+
+        assertTrue(large.toString().length() < 200, "message grew with the payload: " + large);
+        assertEquals(64 * 1024, blobDevice.drainAsVM().length);
+    }
+
+    @Test
+    public void everyByteValueSurvives() {
+        invoke("readAllByteValues");
+
+        final byte[] sent = blobDevice.drainAsVM();
+        assertEquals(256, sent.length);
+        for (int i = 0; i < 256; i++) {
+            assertEquals((byte) i, sent[i], "byte value " + i + " did not survive");
+        }
+    }
+
+    @Test
+    public void deviceDataCannotForgeAPayloadReference() {
+        final JsonObject reply = invoke("readForgedReference");
+
+        assertFalse(reply.has("blobs"), "message announced a payload that was never sent: " + reply);
+        assertEquals(0, blobDevice.drainAsVM().length);
+    }
+
+    @Test
+    public void twoPayloadsGoOutBackToBackInArrayOrder() {
+        final JsonObject reply = invoke("readTwoBlobs");
+
+        final JsonArray blobs = reply.getAsJsonArray("blobs");
+        assertEquals(2, blobs.size(), reply.toString());
+        assertEquals(1, blobs.get(0).getAsJsonObject().get("length").getAsInt());
+        assertEquals(2, blobs.get(1).getAsJsonObject().get("length").getAsInt());
+        assertEquals(0, reply.getAsJsonArray("data").get(0).getAsJsonObject().get("$blob").getAsInt());
+        assertEquals(1, reply.getAsJsonArray("data").get(1).getAsJsonObject().get("$blob").getAsInt());
+        assertArrayEquals(new byte[]{1, 2, 3}, blobDevice.drainAsVM());
+    }
+
+    @Test
+    public void theSameArrayTwiceIsSentOnce() {
+        final JsonObject reply = invoke("readSameBlobTwice");
+
+        assertEquals(1, reply.getAsJsonArray("blobs").size(), reply.toString());
+        assertEquals(0, reply.getAsJsonArray("data").get(1).getAsJsonObject().get("$blob").getAsInt());
+        assertArrayEquals(PAYLOAD, blobDevice.drainAsVM());
+    }
+
+    @Test
+    public void payloadsPastTheCapTogetherAreRefused() {
+        final JsonObject reply = invoke("readTwoHalvesPastTheCap");
+
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_TOO_LARGE, reply.get("data").getAsString(), reply.toString());
+        assertEquals(0, blobDevice.drainAsVM().length, "part of an over-large message was sent");
+    }
+
+    @Test
+    public void failingCallSendsNoPayload() {
+        final JsonObject reply = invoke("readThenFail");
+
+        assertEquals("error", reply.get("type").getAsString(), reply.toString());
+        assertEquals(0, blobDevice.drainAsVM().length,
+            "a call that threw after staging must not put bytes on the wire");
+    }
+
+    @Test
+    public void noNewRequestIsTakenWhileAPayloadIsStillDraining() {
+        setUpWith(new TestSerialDevice(), new TestSerialDevice(1024));
+
+        invoke("readLarge");
+        assertTrue(blobDevice.drainAsVM().length < 64 * 1024, "precondition: drain is partial");
+
+        serialDevice.putAsVM(request("readBlob"));
+        adapter.step(0);
+        assertNull(serialDevice.readMessageAsVM(), "a request was answered mid-transfer");
+
+        for (int i = 0; i < 200; i++) {
+            adapter.step(0);
+            blobDevice.drainAsVM();
+        }
+        assertNotNull(serialDevice.readMessageAsVM(), "request was never answered after the drain");
+    }
+
+    @Test
+    public void resetDropsAPartiallyDrainedPayload() {
+        setUpWith(new TestSerialDevice(), new TestSerialDevice(1024));
+
+        invoke("readLarge");
+        blobDevice.drainAsVM();
+
+        adapter.reset();
+        adapter.step(0);
+        assertEquals(0, blobDevice.drainAsVM().length, "reset must abandon the transfer");
+
+        assertEquals(PAYLOAD.length, invoke("readBlob").getAsJsonArray("blobs").get(0).getAsJsonObject().get("length").getAsInt());
+    }
+
+    @Test
+    public void checksumMatchesTheAgreedAlgorithm() {
+        assertEquals(3421780262L, RPCPayloadChannel.checksum("123456789".getBytes(StandardCharsets.US_ASCII)));
+        assertEquals(2445345482L, RPCPayloadChannel.checksum(PAYLOAD));
+        assertEquals(0, RPCPayloadChannel.checksum(new byte[0]));
+        assertEquals(3066839698L, RPCPayloadChannel.checksum(new byte[]{1, 2}));
+        assertEquals(82329835L, RPCPayloadChannel.checksum(new byte[]{2, 1}));
+    }
+
+    @Test
+    public void checksumChangesWhenAnyByteDoes() {
+        final byte[] corrupted = PAYLOAD.clone();
+        corrupted[3] ^= 0x01;
+
+        assertNotEquals(RPCPayloadChannel.checksum(PAYLOAD),
+            RPCPayloadChannel.checksum(corrupted),
+            "a single flipped bit must change the checksum, or it detects nothing");
+        assertNotEquals(RPCPayloadChannel.checksum(new byte[]{1, 2}),
+            RPCPayloadChannel.checksum(new byte[]{2, 1}),
+            "reordering must change the checksum too");
+    }
+
+    @Test
+    public void emptyPayloadStillRoundTrips() {
+        final JsonObject reply = invoke("readEmpty");
+
+        assertEquals(0, reply.getAsJsonArray("blobs").get(0).getAsJsonObject().get("length").getAsInt());
+        assertEquals(0, blobDevice.drainAsVM().length, "an empty payload should send no bytes");
+    }
+
+    @Test
+    public void payloadPastTheCapIsRefusedBeforeAnyOfItIsSent() {
+        final JsonObject reply = invoke("readPastTheCap");
+
+        assertEquals("error", reply.get("type").getAsString(), reply.toString());
+        assertEquals(RPCDeviceBusAdapter.ERROR_PAYLOAD_TOO_LARGE, reply.get("data").getAsString());
+        assertEquals(0, blobDevice.drainAsVM().length, "part of an over-large payload was sent");
+
+        assertEquals(PAYLOAD.length, invoke("readBlob").getAsJsonArray("blobs").get(0).getAsJsonObject().get("length").getAsInt());
+        assertArrayEquals(PAYLOAD, blobDevice.drainAsVM());
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void setUpWith(final TestSerialDevice rpc, final TestSerialDevice blob) {
+        serialDevice = rpc;
+        blobDevice = blob;
+        eventDevice = new TestSerialDevice();
+        adapter = new RPCDeviceBusAdapter(serialDevice, blobDevice, eventDevice, amount -> true);
+
+        final RPCDevice device = new ObjectDevice(new BlobSource(), "blobs");
+        deviceId = UUID.randomUUID();
+        final Set<Device> devices = new HashSet<>();
+        devices.add(device);
+        final Map<Device, Set<UUID>> identifiers = new HashMap<>();
+        identifiers.put(device, Set.of(deviceId));
+
+        final DeviceBusController busController = mock(DeviceBusController.class);
+        when(busController.getDevices()).thenReturn(devices);
+        when(busController.getDeviceIdentifiers(any()))
+            .then(invocation -> identifiers.get(invocation.getArgument(0)));
+        adapter.rebuild(busController);
+    }
+
+    private String request(final String method) {
+        return "{\"type\":\"invoke\",\"data\":{\"deviceId\":\"" + deviceId
+            + "\",\"name\":\"" + method + "\",\"parameters\":[]}}";
+    }
+
+    private JsonObject invoke(final String method) {
+        serialDevice.putAsVM(request(method));
+        adapter.step(0);
+
+        return serialDevice.readJsonAsVM();
+    }
+
+    public static final class BlobSource {
+        @Callback(synchronize = false)
+        public byte[] readPastTheCap() {
+            return new byte[Constants.RPC_MAX_PAYLOAD_SIZE + 1];
+        }
+
+        @Callback(synchronize = false)
+        public byte[] readBlob() {
+            return PAYLOAD;
+        }
+
+        @Callback(synchronize = false)
+        public byte[] readEmpty() {
+            return new byte[0];
+        }
+
+        @Callback(synchronize = false)
+        public byte[] readLarge() {
+            return new byte[64 * 1024];
+        }
+
+        @Callback(synchronize = false)
+        public byte[] readAllByteValues() {
+            final byte[] data = new byte[256];
+            for (int i = 0; i < data.length; i++) {
+                data[i] = (byte) i;
+            }
+            return data;
+        }
+
+        @Callback(synchronize = false)
+        public Map<String, Object> readForgedReference() {
+            return Map.of("$blob", Map.of("length", 100000, "checksum", 0));
+        }
+
+        @Callback(synchronize = false)
+        public List<byte[]> readTwoBlobs() {
+            return List.of(new byte[]{1}, new byte[]{2, 3});
+        }
+
+        @Callback(synchronize = false)
+        public List<byte[]> readSameBlobTwice() {
+            return List.of(PAYLOAD, PAYLOAD);
+        }
+
+        @Callback(synchronize = false)
+        public List<byte[]> readTwoHalvesPastTheCap() {
+            final int half = Constants.RPC_MAX_PAYLOAD_SIZE / 2 + 1;
+            return List.of(new byte[half], new byte[half]);
+        }
+
+        @Callback(synchronize = false)
+        public Object readThenFail() {
+            throw new IllegalStateException("deliberate");
+        }
+    }
+}

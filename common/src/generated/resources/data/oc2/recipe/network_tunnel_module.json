@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "category": "misc",
+  "key": {
+    "B": "oc2:circuit_board",
+    "C": "#c:ingots/copper",
+    "E": "#c:ender_pearls",
+    "T": "oc2:transistor"
+  },
+  "pattern": [
+    "TEC",
+    " B "
+  ],
+  "result": {
+    "id": "oc2:network_tunnel_module"
+  }
+}

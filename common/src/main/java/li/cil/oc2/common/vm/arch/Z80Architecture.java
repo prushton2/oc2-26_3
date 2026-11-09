@@ -1,0 +1,175 @@
+/* SPDX-License-Identifier: MIT */
+
+package li.cil.oc2.common.vm.arch;
+
+import li.cil.ceres.api.Serialized;
+import li.cil.oc2.api.bus.DeviceBusController;
+import li.cil.oc2.api.bus.device.vm.ArchitectureType;
+import li.cil.oc2.api.bus.device.vm.event.VMInitializingEvent;
+import li.cil.oc2.common.Constants;
+import li.cil.oc2.common.bus.IODeviceBusAdapter;
+import li.cil.sedna.api.device.PhysicalMemory;
+import li.cil.sedna.api.device.serial.SerialDevice;
+import li.cil.sedna.api.memory.MemoryMap;
+import li.cil.sedna.device.bus.DeviceEnumerator;
+import li.cil.sedna.device.flash.FlashMemoryDevice;
+import li.cil.sedna.device.serial.UART16550A;
+import li.cil.sedna.memory.SimpleMemoryMap;
+import li.cil.sedna.z80.BootRomLatch;
+import li.cil.sedna.z80.Z80Board;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.Arrays;
+
+public final class Z80Architecture extends AbstractArchitecture {
+    private static final int ENUMERATOR_PORT = 0xE0;
+    private static final int MLAPI_INTERRUPT = 1;
+
+    // --------------------------------------------------------------------- //
+
+    @Serialized
+    private final Z80Board board;
+    @Serialized
+    private final UART16550A uart;
+    @Serialized
+    private final IODeviceBusAdapter mlapiAdapter;
+    @Serialized
+    private final byte[] bootRom = new byte[Constants.FLASH_MEMORY_SIZE];
+
+    private final transient MemoryMap bootRomMap;
+
+    // --------------------------------------------------------------------- //
+
+    public Z80Architecture(final Config config) {
+        this(new Z80Board(), config);
+    }
+
+    private Z80Architecture(final Z80Board board, final Config config) {
+        super(board, board.getCpu(), config, board.getPortBus());
+        this.board = board;
+        this.uart = new UART16550A();
+        this.mlapiAdapter = new IODeviceBusAdapter(config.consumeEnergy());
+
+        if (!getContext().getInterruptAllocator().claimInterrupt(MLAPI_INTERRUPT)) {
+            throw new IllegalStateException("Mid-level API interrupt is already claimed.");
+        }
+        mlapiAdapter.getInterrupt().set(MLAPI_INTERRUPT, board.getInterruptController());
+
+        board.getCpu().setFrequency(li.cil.oc2.common.Config.z80CycleBudgetPerSecond);
+
+        final ByteBuffer romData = ByteBuffer.wrap(bootRom).order(ByteOrder.LITTLE_ENDIAN);
+        board.setBootRom(new FlashMemoryDevice(romData, true));
+
+        final SimpleMemoryMap romMap = new SimpleMemoryMap();
+        romMap.addDevice(0, new FlashMemoryDevice(romData, false));
+        this.bootRomMap = romMap;
+
+        mapPorts();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public ArchitectureType getType() {
+        return ArchitectureType.Z80;
+    }
+
+    @Override
+    public int getFrequency() {
+        return board.getCpu().getFrequency();
+    }
+
+    @Override
+    public SerialDevice getTerminalDevice() {
+        return uart;
+    }
+
+    @Override
+    public long getInstructionsRetired() {
+        return board.getCpu().getCycles();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public void boot() {
+        if (board.getDevices().stream().noneMatch(device -> device instanceof PhysicalMemory)) {
+            throw new IllegalStateException("No memory mapped.");
+        }
+
+        board.reset();
+        board.setRunning(true);
+    }
+
+    @Override
+    public void step(final int cycles) {
+        board.step(cycles);
+        mlapiAdapter.step();
+    }
+
+    @Override
+    public boolean isRunning() {
+        return board.isRunning() && !board.isHalted();
+    }
+
+    @Override
+    public void setRunning(final boolean value) {
+        board.setRunning(value);
+    }
+
+    @Override
+    public void reset() {
+        board.reset();
+    }
+
+    @Override
+    public void sendInitializingEvent() {
+        Arrays.fill(bootRom, (byte) 0);
+        sendLifecycleEvent(new VMInitializingEvent(bootRomMap, 0));
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public void unmountAllDevices() {
+        super.unmountAllDevices();
+        mlapiAdapter.unmountDevices();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    @Override
+    public void handleAfterDeviceScan(final DeviceBusController controller) {
+        super.handleAfterDeviceScan(controller);
+        mlapiAdapter.rebuild(controller);
+    }
+
+    @Override
+    public void mountDynamicDevices() {
+        mlapiAdapter.mountDevices();
+    }
+
+    @Override
+    public void tickDynamicDevices() {
+        mlapiAdapter.tick();
+    }
+
+    @Override
+    protected void resetDynamicDevices() {
+        mlapiAdapter.reset();
+    }
+
+    // --------------------------------------------------------------------- //
+
+    private void mapPorts() {
+        final DeviceEnumerator enumerator = new DeviceEnumerator(
+            board.getPortMap(), board.getDevices(), board.getInterruptController());
+        if (!board.addPortDevice(ENUMERATOR_PORT, enumerator)
+            || board.addPortDevice(new BootRomLatch(board)).isEmpty()
+            || board.addPortDevice(uart).isEmpty()
+            || board.addPortDevice(mlapiAdapter).isEmpty()) {
+            throw new IllegalStateException("Built-in devices do not fit the port space.");
+        }
+    }
+}
