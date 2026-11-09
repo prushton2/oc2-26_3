@@ -61,9 +61,13 @@ public final class ModRenderPipelines {
 
     /**
      * Opaque, flat colored quads, pulled slightly towards the camera so they can sit on block faces.
+     * <p>
+     * Every pipeline must declare its color target, even opaque ones: the builder starts with none, and a
+     * pipeline with zero targets cannot be drawn into the level's main pass, which has one color attachment.
      */
     public static final RenderPipeline INDICATOR = RenderPipeline.builder(POSITION_COLOR_SNIPPET)
         .withLocation(location("indicator"))
+        .withColorTargetState(ColorTargetState.DEFAULT)
         .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN_OR_EQUAL, true, 1.0f, 10.0f))
         .build();
 
